@@ -67,7 +67,7 @@ export type GrantView = {
   peer: { actor_id: string; handle: string };
   pinned_age_key?: string;
   pinned_signing_key?: string;
-  status: "active" | "key_changed";
+  status: "active" | "key_changed" | "awaiting_peer_repin";
   created_at: string;
 };
 

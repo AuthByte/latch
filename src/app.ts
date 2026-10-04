@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { canonicalEnvelope } from "./canonical.js";
 import { fingerprint, scalarLength, verifyCanonical } from "./crypto.js";
 import { ACTOR_RE, HANDLE_RE, isHttpsBlob, THREAD_RE } from "./ids.js";
@@ -34,6 +35,11 @@ export type AppOptions = {
   webhookRetries?: number;
   opsSecret?: string;
   joinCode?: string;
+  /** Wait for webhook delivery before answering a send. Tests only; the server fires wakes in the background. */
+  awaitWebhooks?: boolean;
+  onWebhookError?: (err: unknown) => void;
+  /** Called after any request that may have changed state (writes, and opening a message). */
+  onMutation?: () => void;
 };
 
 type ErrStatus = 400 | 401 | 403 | 404 | 409 | 410 | 413;
@@ -137,6 +143,24 @@ export function createApp(opts: AppOptions): Hono {
     const actor = store.byToken(token);
     if (!actor) return fail(c, 401, "unauthorized", "Bad token.");
     return actor;
+  }
+
+  app.use(
+    "*",
+    bodyLimit({
+      maxSize: 64 * 1024,
+      onError: (c) => c.json({ error: "body_too_large", hint: "Request body over 64KB." }, 413),
+    }),
+  );
+
+  if (opts.onMutation) {
+    const onMutation = opts.onMutation;
+    app.use("*", async (c, next) => {
+      await next();
+      if (c.req.method !== "GET" || /^\/v0\/inbox\/(?!headers$)/.test(c.req.path)) {
+        onMutation();
+      }
+    });
   }
 
   app.get("/v0/health", (c) =>
@@ -428,6 +452,30 @@ export function createApp(opts: AppOptions): Hono {
         "Publish Ed25519 and age keys before sending. Persist token and recovery_secret first.",
       );
     }
+    const grant = store.findGrant(env.from, env.to);
+    if (!grant) {
+      return fail(c, 403, "no_grant", "No mutual grant. Exchange an invite first (latch invite / latch redeem).");
+    }
+    const view = store.grantView(grant, actor.actorId);
+    if (view.status === "key_changed") {
+      return fail(
+        c,
+        409,
+        "key_changed",
+        "Peer key no longer matches the pin. Halt, re-verify fingerprints out of band, then repin.",
+      );
+    }
+    if (view.status === "awaiting_peer_repin") {
+      return fail(
+        c,
+        409,
+        "key_changed",
+        "Your keys changed since the peer pinned them. Share your new fingerprints out of band; the peer must repin before mail flows.",
+      );
+    }
+    // Signatures verify against the key the recipient pinned for us, not whatever
+    // is published today. status === "active" means they are equal; be explicit.
+    const senderPin = store.pinnedFor(grant, actor.actorId).signing;
     const canonical = canonicalEnvelope({
       v: env.v,
       id: env.id,
@@ -439,21 +487,8 @@ export function createApp(opts: AppOptions): Hono {
       body: env.body,
       blob_url: env.blob_url,
     });
-    if (!verifyCanonical(actor.signingPublicKey, canonical, env.sig)) {
-      return fail(c, 400, "bad_signature", "Envelope sig did not verify.");
-    }
-    const grant = store.findGrant(env.from, env.to);
-    if (!grant) {
-      return fail(c, 403, "no_grant", "No mutual grant. Exchange an invite first.");
-    }
-    const view = store.grantView(grant, actor.actorId);
-    if (view.status === "key_changed") {
-      return fail(
-        c,
-        409,
-        "key_changed",
-        "Peer key no longer matches the pin. Halt and re-verify out of band, then repin.",
-      );
+    if (!senderPin || !verifyCanonical(senderPin, canonical, env.sig)) {
+      return fail(c, 400, "bad_signature", "Envelope sig did not verify against your pinned signing key.");
     }
     const recipient = store.byId(env.to);
     if (!recipient) {
@@ -490,18 +525,16 @@ export function createApp(opts: AppOptions): Hono {
       if (!replayed) {
         const dest = recipient.webhook;
         if (dest) {
-          try {
-            await dispatchInboxNew({
-              dest,
-              to: recipient.actorId,
-              unread: store.unreadCount(recipient.actorId),
-              now: store.now,
-              fetchImpl: opts.fetchImpl,
-              retries: opts.webhookRetries ?? 3,
-            });
-          } catch {
-            /* queued mail is the source of truth */
-          }
+          // Webhook failure is not send failure: queued mail is the source of truth.
+          const wake = dispatchInboxNew({
+            dest,
+            to: recipient.actorId,
+            unread: store.unreadCount(recipient.actorId),
+            now: store.now,
+            fetchImpl: opts.fetchImpl,
+            retries: opts.webhookRetries ?? 3,
+          }).catch((err) => opts.onWebhookError?.(err));
+          if (opts.awaitWebhooks) await wake;
         }
       }
       return c.json(
@@ -522,6 +555,9 @@ export function createApp(opts: AppOptions): Hono {
           "This id was already used with a different envelope.",
         );
       }
+      if (codeOf(err) === "id_taken") {
+        return fail(c, 409, "id_taken", "Message id already in use. Generate a fresh msg_ ULID.");
+      }
       throw err;
     }
   });
@@ -531,7 +567,7 @@ export function createApp(opts: AppOptions): Hono {
     if (actor instanceof Response) return actor;
     const messages = store.headers(actor.actorId);
     return c.json({
-      unread: messages.length,
+      unread: store.unreadCount(actor.actorId),
       webhook_connected: Boolean(actor.webhook),
       messages,
     });

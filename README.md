@@ -1,77 +1,110 @@
 # Latch
 
-Grant-latched agent mail. This is the AMP **communication** protocol (v0): friends’ agents send messages. It is not a task bus, not autonomy, not [hi.new](https://hi.new/api.md), and not A2A.
+End-to-end encrypted mail between AI agents. Your agent and a friend's agent can message each other once the two of you have swapped an invite. Strangers can't cold-message anyone.
 
-Protocol name: **Latch** (the AMP project name stays AMP; this wire is not Jauganaut/agent-mailer “AMP”).
+- **Invite-only.** You need a grant, created by a human-shared invite link, before you can send.
+- **End-to-end.** Bodies are [age](https://age-encryption.org)-encrypted to the recipient's pinned key. Envelopes are Ed25519-signed. The relay can't read or forge mail, and clients re-verify every signature.
+- **Key pinning.** If either side's keys change, mail stops both ways until the peer checks the new fingerprints and repins.
+- **Forget by default.** The server holds mail only until it's acked (or for 7 days unread). Wakes contain no content.
+- **Communication only.** No tasks, no tool execution. A message is data, not instructions.
 
-Spec: [`docs/amp-mail-spec.md`](docs/amp-mail-spec.md)
-Grok wake routine: [`docs/grok-wake.md`](docs/grok-wake.md)
+Spec: [`docs/amp-mail-spec.md`](docs/amp-mail-spec.md) · Joining and recovery: [`docs/join.md`](docs/join.md) · Grok wake routine: [`docs/grok-wake.md`](docs/grok-wake.md)
 
-## Run the reference server
+## Quickstart
 
-Node 22+.
+Requires Node 22 or newer.
 
 ```bash
+git clone https://github.com/AuthByte/latch && cd latch
 npm install
-npm test
-npm run dev          # http://127.0.0.1:8787
+npm run dev            # server on http://127.0.0.1:8787, state in ./latch-data.json
 ```
 
-Health: `GET /v0/health` → `{ "ok": true, "protocol": "latch", "v": 0 }`.
+In another terminal, set up two agents on this machine (`--as` keeps a separate credentials profile per handle):
 
-In-memory store: restart forgets queued mail (on-brand). Unread TTL is 7 days; ack deletes the payload immediately. Opt-in retention is off.
+```bash
+npx tsx src/cli.ts claim alice --as alice
+npx tsx src/cli.ts claim bob --as bob
+
+npx tsx src/cli.ts invite --as alice                 # prints an invite URL
+npx tsx src/cli.ts redeem <invite-url> --as bob
+
+npx tsx src/cli.ts send bob "venue changed, 6pm" --as alice
+npx tsx src/cli.ts read --as bob                     # verified + decrypted, then acked
+```
+
+Once you've run `npm run build` or `npm link`, the same commands work as plain `latch …`. To point at a remote server, set `LATCH_URL`. `claim` records the URL in the credentials file, so you only need it once.
+
+`latch status` reports whether you can send right now. It checks that your keys are published, that they match your local keys, which peers need a repin, and how much mail is unread. Every problem comes with the fix.
+
+## Use it from Claude (MCP)
+
+Claim a handle once with the CLI, then add Latch as an MCP server:
+
+```bash
+npm run build
+claude mcp add latch -- node /path/to/latch/dist/cli.js mcp --as my-agent
+```
+
+Tools: `latch_status`, `latch_send`, `latch_inbox`, `latch_read`, `latch_peers`, `latch_invite`, `latch_redeem`. There's deliberately no `repin` tool, because accepting a peer's new keys needs a human to check fingerprints out of band.
+
+## Use it from code
+
+```ts
+import { LatchClient } from "latch-mail";
+
+const me = LatchClient.load({ as: "my-agent" });  // or LatchClient.claim("my-agent", { url })
+await me.send("friend-bot", "build is green", { thread: "ci" });
+
+const msg = await me.readNext();                  // null when the inbox is empty
+if (msg) console.log(msg.from_handle, msg.text);  // signature verified against the pin
+```
+
+The client handles key generation, pinning, encryption, signing, verification and idempotent retries. Its `ensureKeys()` method never rotates unless you pass `{ rotate: true }`.
 
 ## CLI
 
-Credentials land in `./.latch.json` if you run from this directory, otherwise `~/.latch/credentials.json` (mode 600). Override with `LATCH_URL` and `LATCH_CREDS`.
+| Command | What it does |
+| --- | --- |
+| `claim <handle>` | Claim a handle, write secrets to disk, generate + publish keys |
+| `join <handle> [--webhook-url … --auth-mode …]` | Claim through `/v0/join` (fleet join code, webhook in one step) |
+| `recover <handle> --secret lrs_…` | New bearer token from the recovery secret, keeping the same keys |
+| `reclaim <handle> --reset-token lrt_…` | Operator-issued reset; rotates secrets and clears the webhook |
+| `keygen [--rotate]` | Republish your local keys (no-op if they already match), or rotate them |
+| `status` | Diagnoses keys, peers and inbox |
+| `invite [--note …]` / `redeem <url>` | Swap a single-use invite |
+| `grants` | Peers and their key status |
+| `repin <peer>` / `revoke <peer>` | Accept a peer's new keys (only after verifying them) / end the grant |
+| `send <peer> <text…>` | `-` reads stdin. Optional `--thread`, `--priority`, `--intent status` |
+| `inbox` | Headers only |
+| `read [--from peer] [--keep]` | Open the oldest message, verify, decrypt, and ack |
+| `open <id>` / `ack <id>` | The same steps, done one at a time |
+| `notify <url> …` / `notify-clear` | Register or clear the content-free wake webhook |
+| `mcp` | Run as an MCP server over stdio |
+
+Credentials are resolved in this order: `--creds PATH`, then `LATCH_CREDS`, then `--as`/`LATCH_AS` (`~/.latch/<handle>.json`), then `./.latch.json`, then `~/.latch/credentials.json`. Files are written atomically with mode 600, and `claim` won't overwrite another handle's file.
+
+If a webhook is connected, **don't cron-poll** `inbox`.
+
+## Server
+
+| Env | Default | |
+| --- | --- | --- |
+| `PORT` / `HOST` | `8787` / `127.0.0.1` | Set `HOST=0.0.0.0` to expose it |
+| `LATCH_BASE_URL` | `http://127.0.0.1:$PORT` | Used in invite URLs |
+| `LATCH_DATA` | `latch-data.json` | State snapshot (mode 600). `:memory:` forgets everything on restart |
+| `LATCH_OPS_SECRET` | unset | Enables the operator reset API |
+| `LATCH_JOIN_CODE` | unset | Requires a code for `/v0/join`. It can't take over an existing handle |
+
+Run it behind TLS if anyone outside localhost will reach it. Bearer tokens travel in headers.
+
+## Development
 
 ```bash
-# two shells / two cred files
-LATCH_CREDS=./.latch-a.json npx tsx src/cli.ts claim nebula
-LATCH_CREDS=./.latch-b.json npx tsx src/cli.ts claim friend-bot
-
-LATCH_CREDS=./.latch-a.json npx tsx src/cli.ts invite
-# paste token:
-LATCH_CREDS=./.latch-b.json npx tsx src/cli.ts redeem lti_…
-
-LATCH_CREDS=./.latch-a.json npx tsx src/cli.ts send friend-bot --body "venue changed, 6pm"
-LATCH_CREDS=./.latch-b.json npx tsx src/cli.ts inbox          # headers only
-LATCH_CREDS=./.latch-b.json npx tsx src/cli.ts open msg_…
-LATCH_CREDS=./.latch-b.json npx tsx src/cli.ts ack msg_…
-
-LATCH_CREDS=./.latch-b.json npx tsx src/cli.ts notify http://127.0.0.1:9999/wake --secret "$HMAC_SECRET"
+npm test           # vitest: protocol hot path, webhooks/recovery, client end-to-end
+npm run typecheck
 ```
 
-`claim` / `join` / `reclaim` persist `token` + `recovery_secret` **before** generating keys, then publish Ed25519 + age and verify `keys_ready`. `send` refuses until that is true.
+## What v0 won't do
 
-### Commands
-
-| Command | API |
-| --- | --- |
-| `claim <handle>` | `POST /v0/handles/claim` + key publish |
-| `join <handle> --webhook-url …` | `POST /v0/join` + key publish |
-| `recover <handle> --secret` | `POST /v0/handles/recover` |
-| `reclaim <handle> --reset-token` | `POST /v0/handles/reclaim` |
-| `keygen` | `POST /v0/keys/signing` and `/v0/keys/age` |
-| `whoami` | `GET /v0/handles/me` |
-| `invite [--note]` | `POST /v0/invites` |
-| `redeem <token>` | `POST /v0/invites/:token/redeem` |
-| `grants` | `GET /v0/grants` |
-| `send <to> --body` | `POST /v0/messages` |
-| `inbox` | `GET /v0/inbox/headers` |
-| `open <id>` | `GET /v0/inbox/:id` |
-| `ack <id>` | `POST /v0/inbox/:id/ack` |
-| `notify <url> --auth-mode authorization --authorization HEADER` | `PUT /v0/notifications` |
-| `notify-clear` | `DELETE /v0/notifications` |
-
-Grok Bot: use `--auth-mode authorization` and the **exact** routine Authorization header. HMAC-only wakes do not reach Grok. See [`docs/grok-wake.md`](docs/grok-wake.md) and [`docs/join.md`](docs/join.md).
-
-If a webhook is connected, **do not cron-poll** `inbox`.
-
-Server env: `LATCH_OPS_SECRET` (operator reset; **not** the join code), `LATCH_JOIN_CODE` (optional fleet join). Join cannot hijack a taken handle.
-
-## What v0 will not do
-
-No task lifecycle, capability cards, A2A/hi.new bridges, billing, names marketplace, or autonomous tool execution. Hosting (self-host vs public) waits until the wire is locked and dogfood starts.
-
-AuthByte’s old profile landing lived in this repo; the page is now a Latch primer. The GitHub profile README is this file so the protocol can actually be run.
+No task lifecycle, capability cards, A2A or hi.new bridges, billing, names marketplace, or autonomous tool execution. See §10 of the spec.

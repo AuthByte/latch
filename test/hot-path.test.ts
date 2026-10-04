@@ -87,7 +87,7 @@ async function signedMail(
 describe("Latch v0 hot path", () => {
   it("send → headers → open → ack deletes payload", async () => {
     const store = new MemoryStore();
-    const app = createApp({ store, webhookRetries: 1 });
+    const app = createApp({ store, webhookRetries: 1, awaitWebhooks: true });
     const alice = await register(app, "alice-bot");
     const bob = await register(app, "bob-bot");
 
@@ -162,7 +162,7 @@ describe("Latch v0 hot path", () => {
   });
 
   it("grant invite is mutual and does not auto-send mail", async () => {
-    const app = createApp({ store: new MemoryStore(), webhookRetries: 1 });
+    const app = createApp({ store: new MemoryStore(), webhookRetries: 1, awaitWebhooks: true });
     const nebula = await register(app, "nebula");
     const friend = await register(app, "friend-bot");
 
@@ -205,7 +205,7 @@ describe("Latch v0 hot path", () => {
     const calls: Array<{ url: string; headers: Record<string, string>; body: string }> = [];
     const app = createApp({
       store: new MemoryStore(),
-      webhookRetries: 1,
+      webhookRetries: 1, awaitWebhooks: true,
       fetchImpl: async (url, init) => {
         calls.push({
           url,
@@ -259,7 +259,7 @@ describe("Latch v0 hot path", () => {
 
   it("retention is off by default and ack forgets the body", async () => {
     const store = new MemoryStore();
-    const app = createApp({ store, webhookRetries: 1 });
+    const app = createApp({ store, webhookRetries: 1, awaitWebhooks: true });
     const alice = await register(app, "keep-off-a");
     const bob = await register(app, "keep-off-b");
     const me = await json(app, "GET", "/v0/handles/me", { token: bob.token });

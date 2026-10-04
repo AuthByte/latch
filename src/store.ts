@@ -70,6 +70,14 @@ export type StoredMessage = {
   payload: string | null;
 };
 
+export type ResetTicket = {
+  tokenHash: string;
+  handle: string;
+  actorId: string;
+  expiresAt: number;
+  spent: boolean;
+};
+
 export type Clock = () => number;
 
 export class MemoryStore {
@@ -81,13 +89,7 @@ export class MemoryStore {
   messages = new Map<string, StoredMessage>();
   /** from+id → message id */
   idempotency = new Map<string, string>();
-  resetTickets = new Map<string, {
-    tokenHash: string;
-    handle: string;
-    actorId: string;
-    expiresAt: number;
-    spent: boolean;
-  }>();
+  resetTickets = new Map<string, ResetTicket>();
 
   constructor(public now: Clock = () => Date.now()) {}
 
@@ -150,19 +152,35 @@ export class MemoryStore {
   }
 
   publishAge(actor: Actor, publicKey: string): void {
-    if (!publicKey.startsWith("age1")) {
+    if (!/^age1[0-9a-z]{58}$/.test(publicKey)) {
       throw Object.assign(new Error("invalid_age_key"), { code: "invalid_age_key" });
     }
     actor.agePublicKey = publicKey;
+    this.fillEmptyPins(actor, "age", publicKey);
   }
 
   publishSigning(actor: Actor, publicKey: string): void {
-    if (!publicKey.startsWith("ed25519:")) {
+    if (!/^ed25519:[A-Za-z0-9_-]{43}$/.test(publicKey)) {
       throw Object.assign(new Error("invalid_signing_key"), {
         code: "invalid_signing_key",
       });
     }
     actor.signingPublicKey = publicKey;
+    this.fillEmptyPins(actor, "signing", publicKey);
+  }
+
+  /**
+   * A grant redeemed before an actor published a key pinned nothing for that
+   * slot. The first key published afterwards fills the empty pin (same trust as
+   * redeem). A key that replaces an existing pin never does: that is a rotation
+   * and flips the grant to key_changed.
+   */
+  private fillEmptyPins(actor: Actor, slot: "age" | "signing", key: string): void {
+    for (const g of this.grants.values()) {
+      if (g.revoked) continue;
+      const pin = g.a === actor.actorId ? g.pinA : g.b === actor.actorId ? g.pinB : null;
+      if (pin && pin[slot] === undefined) pin[slot] = key;
+    }
   }
 
   createInvite(fromActorId: string, note?: string): Invite {
@@ -237,6 +255,23 @@ export class MemoryStore {
     return pin.age !== peer.agePublicKey || pin.signing !== peer.signingPublicKey;
   }
 
+  /**
+   * Status from the viewer's side. `key_changed`: the peer's keys moved and the
+   * viewer must re-verify and repin. `awaiting_peer_repin`: the viewer's own keys
+   * moved and the peer has to repin. Mail is blocked both ways in either state.
+   */
+  grantStatus(grant: Grant, viewerId: string): GrantView["status"] {
+    const peerId = grant.a === viewerId ? grant.b : grant.a;
+    if (this.peerKeyChanged(grant, peerId)) return "key_changed";
+    if (this.peerKeyChanged(grant, viewerId)) return "awaiting_peer_repin";
+    return "active";
+  }
+
+  /** The key the peer pinned for `actorId` — what their signatures must verify against. */
+  pinnedFor(grant: Grant, actorId: string): { age?: string; signing?: string } {
+    return actorId === grant.a ? grant.pinA : grant.pinB;
+  }
+
   grantView(grant: Grant, viewerId: string): GrantView {
     const peerId = grant.a === viewerId ? grant.b : grant.a;
     const peer = this.actors.get(peerId);
@@ -249,7 +284,7 @@ export class MemoryStore {
       },
       pinned_age_key: pin.age,
       pinned_signing_key: pin.signing,
-      status: this.peerKeyChanged(grant, peerId) ? "key_changed" : "active",
+      status: this.grantStatus(grant, viewerId),
       created_at: new Date(grant.createdAt).toISOString(),
     };
   }
@@ -322,6 +357,9 @@ export class MemoryStore {
       }
       return { message: existing, replayed: true };
     }
+    if (this.messages.has(envelope.id)) {
+      throw Object.assign(new Error("id_taken"), { code: "id_taken" });
+    }
     const bytes = Buffer.byteLength(envelope.body, "utf8");
     const stored: StoredMessage = {
       envelope,
@@ -347,7 +385,7 @@ export class MemoryStore {
     return n;
   }
 
-  headers(actorId: string): InboxHeader[] {
+  headers(actorId: string, limit = 100): InboxHeader[] {
     this.expireDue();
     const rows: InboxHeader[] = [];
     for (const m of this.messages.values()) {
@@ -366,7 +404,9 @@ export class MemoryStore {
         created_at: new Date(m.queuedAt).toISOString(),
       });
     }
-    return rows.sort((a, b) => a.created_at.localeCompare(b.created_at)).slice(0, 100);
+    return rows
+      .sort((a, b) => a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id))
+      .slice(0, limit);
   }
 
   open(actorId: string, id: string): StoredMessage | "gone" | "missing" {
@@ -474,6 +514,14 @@ export class MemoryStore {
         this.grants.delete(key);
       }
     }
+    for (const m of this.messages.values()) {
+      if (m.envelope.to === actor.actorId && m.payload !== null) {
+        m.status = "expired";
+        m.expiredAt = this.now();
+        m.payload = null;
+        m.envelope = { ...m.envelope, body: "" };
+      }
+    }
     return true;
   }
 
@@ -500,6 +548,42 @@ export class MemoryStore {
         keys_ready: Boolean(a.agePublicKey && a.signingPublicKey),
       }));
   }
+}
+
+export type Snapshot = {
+  v: 1;
+  actors: Actor[];
+  invites: Invite[];
+  grants: Grant[];
+  messages: StoredMessage[];
+  idempotency: Array<[string, string]>;
+  resetTickets: Array<[string, ResetTicket]>;
+};
+
+export function snapshotStore(store: MemoryStore): Snapshot {
+  return {
+    v: 1,
+    actors: [...store.actors.values()],
+    invites: [...store.invites.values()],
+    grants: [...store.grants.values()].filter((g) => !g.revoked),
+    messages: [...store.messages.values()],
+    idempotency: [...store.idempotency.entries()],
+    resetTickets: [...store.resetTickets.entries()],
+  };
+}
+
+export function restoreStore(store: MemoryStore, snap: Snapshot): void {
+  if (snap.v !== 1) throw new Error(`unsupported snapshot version ${String(snap.v)}`);
+  for (const a of snap.actors) {
+    store.actors.set(a.actorId, a);
+    store.actorsByHandle.set(a.handle, a.actorId);
+    store.actorsByTokenHash.set(a.tokenHash, a.actorId);
+  }
+  for (const i of snap.invites) store.invites.set(i.token, i);
+  for (const g of snap.grants) store.grants.set(store.pairKey(g.a, g.b), g);
+  for (const m of snap.messages) store.messages.set(m.envelope.id, m);
+  for (const [k, v] of snap.idempotency) store.idempotency.set(k, v);
+  for (const [k, v] of snap.resetTickets) store.resetTickets.set(k, v);
 }
 
 export function codeOf(err: unknown): string | undefined {

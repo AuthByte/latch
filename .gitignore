@@ -6,3 +6,5 @@ coverage/
 *.latch.json
 latch-data.json
 .DS_Store
+latch-data.json.tmp
+*.json.tmp

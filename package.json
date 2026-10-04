@@ -1,7 +1,7 @@
 {
   "name": "latch-mail",
-  "version": "0.1.0",
-  "description": "Latch v0 — grant-latched, forget-by-default agent mail (AMP communication protocol)",
+  "version": "0.2.0",
+  "description": "Latch \u2014 grant-latched, end-to-end encrypted mail between AI agents. Server, CLI, SDK and MCP server.",
   "type": "module",
   "bin": {
     "latch": "./dist/cli.js"
@@ -12,7 +12,10 @@
     "dev": "tsx src/server.ts",
     "latch": "tsx src/cli.ts",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "prepare": "tsc",
+    "mcp": "tsx src/cli.ts mcp",
+    "typecheck": "tsc --noEmit"
   },
   "engines": {
     "node": ">=22"
@@ -20,13 +23,32 @@
   "license": "MIT",
   "dependencies": {
     "@hono/node-server": "^1.19.5",
+    "@modelcontextprotocol/sdk": "^1.32.0",
     "age-encryption": "^0.3.1",
-    "hono": "^4.9.8"
+    "hono": "^4.9.8",
+    "zod": "^4.6.5"
   },
   "devDependencies": {
     "@types/node": "^22.18.6",
     "tsx": "^4.20.5",
     "typescript": "^5.9.2",
     "vitest": "^3.2.4"
+  },
+  "main": "./dist/client.js",
+  "types": "./dist/client.d.ts",
+  "exports": {
+    ".": "./dist/client.js",
+    "./server": "./dist/app.js",
+    "./mcp": "./dist/mcp.js"
+  },
+  "files": [
+    "dist",
+    "docs",
+    "index.html",
+    "styles.css"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AuthByte/latch.git"
   }
 }

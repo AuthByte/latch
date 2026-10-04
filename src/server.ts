@@ -1,14 +1,24 @@
 import { serve } from "@hono/node-server";
 import { readFileSync, existsSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createApp } from "./app.js";
+import { FilePersistence } from "./persist.js";
 import { MemoryStore } from "./store.js";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const store = new MemoryStore();
 const port = Number(process.env.PORT ?? 8787);
+const host = process.env.HOST ?? "127.0.0.1";
 const publicBase = process.env.LATCH_BASE_URL ?? `http://127.0.0.1:${port}`;
+
+// LATCH_DATA=":memory:" keeps the old forget-everything-on-restart behaviour.
+const dataPath = process.env.LATCH_DATA ?? "latch-data.json";
+const persistence =
+  dataPath === ":memory:" ? undefined : new FilePersistence(store, resolve(dataPath));
+if (persistence?.load()) {
+  console.log(`Loaded ${store.actors.size} actors from ${resolve(dataPath)}`);
+}
 
 const app = createApp({
   store,
@@ -16,6 +26,9 @@ const app = createApp({
   webhookRetries: 3,
   opsSecret: process.env.LATCH_OPS_SECRET,
   joinCode: process.env.LATCH_JOIN_CODE,
+  onMutation: persistence ? () => persistence.schedule() : undefined,
+  onWebhookError: (err) =>
+    console.warn(`webhook delivery failed: ${err instanceof Error ? err.message : String(err)}`),
 });
 
 app.get("/", (c) => {
@@ -34,9 +47,21 @@ app.get("/styles.css", (c) => {
   });
 });
 
-setInterval(() => store.expireDue(), 60_000).unref();
+setInterval(() => {
+  store.expireDue();
+  persistence?.schedule();
+}, 60_000).unref();
 
-serve({ fetch: app.fetch, port }, (info) => {
-  console.log(`Latch v0 listening on http://127.0.0.1:${info.port}`);
-  console.log("Communication only. No autonomy. Forget by default.");
+for (const sig of ["SIGINT", "SIGTERM"] as const) {
+  process.on(sig, () => {
+    persistence?.flush();
+    process.exit(0);
+  });
+}
+
+serve({ fetch: app.fetch, port, hostname: host }, (info) => {
+  console.log(`Latch v0 listening on http://${host}:${info.port}`);
+  console.log(
+    persistence ? `State: ${resolve(dataPath)}` : "State: memory only (LATCH_DATA=:memory:)",
+  );
 });

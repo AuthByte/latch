@@ -50,7 +50,7 @@ describe("Grok authorization wakes + recovery", () => {
 
     const grokApp = createApp({
       store: new MemoryStore(),
-      webhookRetries: 1,
+      webhookRetries: 1, awaitWebhooks: true,
       fetchImpl: async (_url, init) => {
         grokCalls.push({ headers: init.headers, body: init.body });
         return { ok: true, status: 200 };
@@ -58,7 +58,7 @@ describe("Grok authorization wakes + recovery", () => {
     });
     const hmacApp = createApp({
       store: new MemoryStore(),
-      webhookRetries: 1,
+      webhookRetries: 1, awaitWebhooks: true,
       fetchImpl: async (_url, init) => {
         hmacCalls.push({ headers: init.headers, body: init.body });
         return { ok: true, status: 200 };
@@ -188,7 +188,7 @@ describe("Grok authorization wakes + recovery", () => {
     const store = new MemoryStore();
     const app = createApp({
       store,
-      webhookRetries: 1,
+      webhookRetries: 1, awaitWebhooks: true,
       opsSecret: OPS,
       joinCode: JOIN,
     });
@@ -264,7 +264,7 @@ describe("Grok authorization wakes + recovery", () => {
     const app = createApp({
       store: new MemoryStore(),
       opsSecret: OPS,
-      webhookRetries: 1,
+      webhookRetries: 1, awaitWebhooks: true,
     });
     const claimed = await json(app, "POST", "/v0/handles/claim", {
       body: { handle: "redact-bot" },
@@ -295,7 +295,7 @@ describe("Grok authorization wakes + recovery", () => {
   });
 
   it("rejects send until age and signing keys are published", async () => {
-    const app = createApp({ store: new MemoryStore(), webhookRetries: 1 });
+    const app = createApp({ store: new MemoryStore(), webhookRetries: 1, awaitWebhooks: true });
     const a = await json(app, "POST", "/v0/handles/claim", { body: { handle: "no-keys" } });
     const b = await json(app, "POST", "/v0/handles/claim", { body: { handle: "peer" } });
     const sa = generateSigning();

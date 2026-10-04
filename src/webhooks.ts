@@ -9,7 +9,12 @@ export type WakeBody = {
 
 export type FetchLike = (
   url: string,
-  init: { method: string; headers: Record<string, string>; body: string },
+  init: {
+    method: string;
+    headers: Record<string, string>;
+    body: string;
+    signal?: AbortSignal;
+  },
 ) => Promise<{ ok: boolean; status: number }>;
 
 export type WebhookDest = {
@@ -20,6 +25,7 @@ export type WebhookDest = {
 };
 
 const BACKOFF_MS = [1000, 4000, 16000];
+const TIMEOUT_MS = 10_000;
 
 export function webhookDispatchHeaders(opts: {
   authMode: AuthMode;
@@ -116,6 +122,7 @@ export async function dispatchInboxNew(opts: {
         method: "POST",
         headers,
         body: raw,
+        signal: AbortSignal.timeout(TIMEOUT_MS),
       });
       if (res.ok) return;
       lastErr = new Error(`webhook_status_${res.status}`);

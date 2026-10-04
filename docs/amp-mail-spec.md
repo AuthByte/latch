@@ -122,9 +122,15 @@ Grant object (viewer’s perspective):
 }
 ```
 
-`status` is `active` or `key_changed`.
+`status`, from the viewer’s side:
 
-Send is allowed only if a mutual grant exists **and** `status === "active"`. `403 no_grant` otherwise. `409 key_changed` if the pin is stale — **halt**. Do not send. Do not encrypt to the new key. Re-verify fingerprints out of band, then `repin`.
+| Status | Meaning | Who acts |
+| --- | --- | --- |
+| `active` | Both sides’ pins match both sides’ published keys | – |
+| `key_changed` | The **peer’s** keys no longer match your pin | You: re-verify out of band, then `repin` |
+| `awaiting_peer_repin` | **Your** keys no longer match the peer’s pin of you | The peer repins after checking your new fingerprints |
+
+Send is allowed only if a mutual grant exists **and** `status === "active"`. `403 no_grant` otherwise. `409 key_changed` for either non-active status — **halt**, in both directions. Do not send. Do not encrypt to the new key. Re-verify fingerprints out of band, then `repin`.
 
 ---
 
@@ -146,7 +152,11 @@ Each returns `{ "fingerprint", "published_at" }`. Fingerprint is the first 16 he
 
 **Pin:** on redeem, each side stores the peer’s then-current age and signing public keys.
 
-**Rotate:** publish a new public key. Every grant where this actor is the peer whose pin no longer matches **flips to `key_changed`**. Existing queued ciphertext stays until ack/TTL; new sends to/from that grant are blocked.
+**Rotate:** publish a new public key. Every grant where this actor is the peer whose pin no longer matches **flips to `key_changed`** (and to `awaiting_peer_repin` from the rotating actor’s side). Existing queued ciphertext stays until ack/TTL; new sends to **and** from that grant are blocked.
+
+**Empty pins:** if a grant was redeemed before an actor published a key, that pin slot is empty. The first key the actor publishes afterwards fills it (the same trust redeem would have given). A key that **replaces** a non-empty pin is a rotation, never a fill.
+
+**Clients don’t rotate by accident.** Publishing the same key again is a no-op. Reference CLI `latch keygen` republishes local keys and only rotates with `--rotate`. New private keys are written to disk before their public halves are published.
 
 **Halt (`key_changed`):** stop. Tell the human. Re-verify the new fingerprint on a channel you already trust. Then `POST /v0/grants/:id/repin`. Do not treat a key change as “the same friend, new laptop” without that check — the handle may have changed hands.
 
@@ -189,7 +199,7 @@ Canonical bytes for `sig`: UTF-8 `JSON.stringify` of an object with keys in this
 
 `v`, `id`, `from`, `to`, `intent`, `priority`, `thread_id?`, `body`, `blob_url?`
 
-Verify against **the sender’s published signing key**. If that key does not match the recipient’s pin → do not queue (`409 key_changed`).
+The server verifies against **the signing key the recipient pinned for the sender** (`409 key_changed` if that differs from the published key, `400 bad_signature` if it does not verify). Recipients MUST verify again locally, against their own pin, after opening: the relay is not trusted to be honest about `from` or `body`. The reference client refuses to return a message that fails this check.
 
 ### 5.1 Not in v0
 
@@ -267,7 +277,7 @@ POST /v0/messages
 
 Full envelope. `201`: `{ "id", "queued_at", "expires_at", "replayed": false }`.
 
-Idempotency: same `(from, id)` with the same canonical bytes → `200` and `replayed: true` (original queue row). Same id, different bytes → `409`.
+Idempotency: same `(from, id)` with the same canonical bytes → `200` and `replayed: true` (original queue row). Same id, different bytes → `409 idempotency_conflict`. An id already used by a **different** sender → `409 id_taken` (ids address the recipient’s inbox; they must not collide).
 
 If the recipient published an age key, `body` MUST be age-armored. Encrypt to the **pin**, not “whatever `/handles/:handle` says today.” If `key_changed`, do not send.
 
@@ -406,7 +416,7 @@ Grok Bot’s native webhook listener authenticates the POST with the routine’s
 
 The Grok routine does **not** verify `X-Latch-Signature`. It still treats the JSON as untrusted metadata (no bodies, no senders) and then calls Latch with its `lat_` token.
 
-Retries: at least 3 attempts, exponential backoff (1s, 4s, 16s). Give up; **mail stays queued**. Webhook failure is not send failure. Timeout 10s.
+Retries: at least 3 attempts, exponential backoff (1s, 4s, 16s). Give up; **mail stays queued**. Webhook failure is not send failure, and wake delivery MUST NOT delay the send response (the reference server dispatches in the background). Timeout 10s per attempt.
 
 ### 7.4 If a webhook is connected
 
@@ -438,6 +448,8 @@ When retention is on: the server MAY keep the body until `ttl_seconds` after ack
 
 Reference server: unread sweeper on read and on an interval. Expired payloads are deleted; receipt `status: "expired"`.
 
+Durability is not retention. The reference server snapshots its state (identities, token hashes, grants, unexpired queue) to `LATCH_DATA` (default `latch-data.json`, mode 600) so a restart does not void every agent’s credentials or drop undelivered mail. Acked payloads are already gone from the store, so they are gone from the snapshot. `LATCH_DATA=:memory:` restores the forget-everything-on-restart mode.
+
 ---
 
 ## 9. Client sequence (normative)
@@ -451,7 +463,7 @@ claim → store token + recovery_secret
       → on inbox.new: verify HMAC → GET headers → open one → data only → persist → ack
 ```
 
-CLI verbs matching this spec: `claim`, `recover`, `keygen`, `invite`, `redeem`, `grants`, `send`, `inbox` (headers), `open`, `ack`, `notify`.
+CLI verbs matching this spec: `claim`, `join`, `recover`, `reclaim`, `keygen`, `status`, `invite`, `redeem`, `grants`, `repin`, `revoke`, `send`, `inbox` (headers), `read` (open oldest + verify + decrypt + ack), `open`, `ack`, `notify`, `notify-clear`, `mcp`.
 
 ---
 
@@ -466,7 +478,7 @@ Explicitly out of spec and out of the reference server:
 - **Autonomy**, tool execution, coordinator/specialist routing.
 - **Capability cards**, public `.well-known` discovery.
 - **Task lifecycle** (`task_id` / `task_state` / offer-accept-result).
-- **MCP-as-transport** (MCP may later be a facade over this HTTP API; the bus is HTTP JSON).
+- **MCP-as-transport.** `latch mcp` is a facade over this HTTP API (tools: status, send, inbox, read, peers, invite, redeem). The bus is HTTP JSON. `repin` is deliberately not an MCP tool: accepting new keys needs a human’s out-of-band check.
 - Groups, scoped OAuth, WebSocket-into-the-model, federation/DID/ANP.
 - Approval-as-work-grant (human approval for *opening a body* is a client policy, not an envelope field).
 
