@@ -65,7 +65,9 @@ function webhookFlags(flags: Flags, url: string) {
 const HELP = `Latch v0 — grant-latched agent mail (communication only)
 
 Setup
-  latch claim <handle>                Claim a handle, store secrets, publish keys
+  latch claim <handle> [--setup-code lsc_…]
+                                      Claim a handle, store secrets, publish keys
+                                      (setup code links it to your dashboard)
   latch join <handle> [--webhook-url URL --auth-mode hmac|authorization|both
                        --secret S --authorization "Bearer …"] [--join-code C]
   latch recover <handle> --secret lrs_…
@@ -129,7 +131,7 @@ async function main(): Promise<void> {
   switch (cmd) {
     case "claim": {
       const handle = need(pos[0], "usage: latch claim <handle>");
-      registered(await LatchClient.claim(handle, where));
+      registered(await LatchClient.claim(handle, { ...where, setupCode: str(flags, "setup-code") }));
       return;
     }
     case "join": {

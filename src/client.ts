@@ -173,12 +173,14 @@ export class LatchClient {
   /** Claim a new handle, store secrets, publish keys. */
   static async claim(
     handle: string,
-    opts?: { url?: string; path?: string; as?: string },
+    opts?: { url?: string; path?: string; as?: string; setupCode?: string },
   ): Promise<LatchClient> {
     const url = opts?.url ?? process.env.LATCH_URL ?? DEFAULT_URL;
     const path = resolveCredsPath({ path: opts?.path, as: opts?.as });
     guardOverwrite(path, handle);
-    const j = await call(url, "POST", "/v0/handles/claim", { body: { handle } });
+    const body: Json = { handle };
+    if (opts?.setupCode) body.setup_code = opts.setupCode;
+    const j = await call(url, "POST", "/v0/handles/claim", { body });
     const client = LatchClient.fromRegistration(url, path, j);
     await client.ensureKeys();
     return client;

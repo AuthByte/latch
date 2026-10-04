@@ -4,6 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createApp } from "./app.js";
 import { FilePersistence } from "./persist.js";
+import { ownerFromEnv, pgStoreFromUrl } from "./env.js";
 import { MemoryStore } from "./store.js";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -13,15 +14,18 @@ const host = process.env.HOST ?? "127.0.0.1";
 const publicBase = process.env.LATCH_BASE_URL ?? `http://127.0.0.1:${port}`;
 
 // LATCH_DATA=":memory:" keeps the old forget-everything-on-restart behaviour.
+// SUPABASE_DB_URL switches to Postgres; otherwise state is a local snapshot file.
+const dbUrl = process.env.SUPABASE_DB_URL;
 const dataPath = process.env.LATCH_DATA ?? "latch-data.json";
 const persistence =
-  dataPath === ":memory:" ? undefined : new FilePersistence(store, resolve(dataPath));
+  dbUrl || dataPath === ":memory:" ? undefined : new FilePersistence(store, resolve(dataPath));
 if (persistence?.load()) {
   console.log(`Loaded ${store.actors.size} actors from ${resolve(dataPath)}`);
 }
 
 const app = createApp({
-  store,
+  store: dbUrl ? pgStoreFromUrl(dbUrl) : store,
+  owner: ownerFromEnv(),
   publicBase,
   webhookRetries: 3,
   opsSecret: process.env.LATCH_OPS_SECRET,
@@ -62,6 +66,10 @@ for (const sig of ["SIGINT", "SIGTERM"] as const) {
 serve({ fetch: app.fetch, port, hostname: host }, (info) => {
   console.log(`Latch v0 listening on http://${host}:${info.port}`);
   console.log(
-    persistence ? `State: ${resolve(dataPath)}` : "State: memory only (LATCH_DATA=:memory:)",
+    dbUrl
+      ? "State: Postgres (SUPABASE_DB_URL)"
+      : persistence
+        ? `State: ${resolve(dataPath)}`
+        : "State: memory only (LATCH_DATA=:memory:)",
   );
 });

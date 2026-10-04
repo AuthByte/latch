@@ -1,7 +1,7 @@
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { canonicalEnvelope } from "./canonical.js";
-import { fingerprint, scalarLength, verifyCanonical } from "./crypto.js";
+import { fingerprint, scalarLength, sha256hex, verifyCanonical } from "./crypto.js";
 import { ACTOR_RE, HANDLE_RE, isHttpsBlob, THREAD_RE } from "./ids.js";
 import {
   BODY_AGE_BYTES,
@@ -19,7 +19,8 @@ import {
   type AuthMode,
   type Envelope,
 } from "./types.js";
-import { codeOf, MemoryStore, type Actor } from "./store.js";
+import { asyncStore, codeOf, MemoryStore } from "./store.js";
+import { pinFor, type Actor, type Store } from "./store-types.js";
 import {
   dispatchInboxNew,
   publicWebhookView,
@@ -27,9 +28,10 @@ import {
   type WebhookDest,
 } from "./webhooks.js";
 import { timingSafeEqual } from "node:crypto";
+import { registerOwnerRoutes, type OwnerOptions } from "./owner.js";
 
 export type AppOptions = {
-  store: MemoryStore;
+  store: Store | MemoryStore;
   publicBase?: string;
   fetchImpl?: FetchLike;
   webhookRetries?: number;
@@ -38,8 +40,12 @@ export type AppOptions = {
   /** Wait for webhook delivery before answering a send. Tests only; the server fires wakes in the background. */
   awaitWebhooks?: boolean;
   onWebhookError?: (err: unknown) => void;
+  /** Serverless hosts: keep the function alive for background webhook delivery. */
+  waitUntil?: (p: Promise<unknown>) => void;
   /** Called after any request that may have changed state (writes, and opening a message). */
   onMutation?: () => void;
+  /** Dashboard (owner) API. Without `verify`, owner routes answer 401. */
+  owner?: Partial<Omit<OwnerOptions, "store" | "publicBase">>;
 };
 
 type ErrStatus = 400 | 401 | 403 | 404 | 409 | 410 | 413;
@@ -132,15 +138,15 @@ function parseWebhookDest(body: {
 
 export function createApp(opts: AppOptions): Hono {
   const app = new Hono();
-  const store = opts.store;
+  const store: Store = opts.store instanceof MemoryStore ? asyncStore(opts.store) : opts.store;
   const publicBase = (opts.publicBase ?? "http://127.0.0.1:8787").replace(/\/$/, "");
 
-  function auth(
+  async function auth(
     c: { req: { header: (n: string) => string | undefined }; json: (x: unknown, s?: ErrStatus) => Response },
-  ): Actor | Response {
+  ): Promise<Actor | Response> {
     const token = bearer(c);
     if (!token) return fail(c, 401, "unauthorized", "Missing bearer token.");
-    const actor = store.byToken(token);
+    const actor = await store.byToken(token);
     if (!actor) return fail(c, 401, "unauthorized", "Bad token.");
     return actor;
   }
@@ -168,7 +174,7 @@ export function createApp(opts: AppOptions): Hono {
   );
 
   app.post("/v0/handles/claim", async (c) => {
-    let body: { handle?: string; recovery_secret?: string };
+    let body: { handle?: string; recovery_secret?: string; setup_code?: string };
     try {
       body = await c.req.json();
     } catch {
@@ -176,10 +182,10 @@ export function createApp(opts: AppOptions): Hono {
     }
     const handle = (body.handle ?? "").trim().toLowerCase();
     try {
-      const { actor, token, recovery_secret } = store.claim(
-        handle,
-        body.recovery_secret,
-      );
+      const { actor, token, recovery_secret } = await store.claim(handle, {
+        recovery: body.recovery_secret,
+        setupCodeHash: body.setup_code ? sha256hex(body.setup_code) : undefined,
+      });
       return c.json(
         {
           actor_id: actor.actorId,
@@ -204,6 +210,12 @@ export function createApp(opts: AppOptions): Hono {
       if (code === "handle_taken") {
         return fail(c, 409, "handle_taken", "That handle is already claimed.");
       }
+      if (code === "handle_reserved") {
+        return fail(c, 409, "handle_reserved", "That handle is reserved. Claim it with the setup code from the dashboard.");
+      }
+      if (code === "bad_setup_code") {
+        return fail(c, 401, "bad_setup_code", "Setup code is wrong or expired. Make a new one in the dashboard.");
+      }
       throw err;
     }
   });
@@ -217,7 +229,7 @@ export function createApp(opts: AppOptions): Hono {
     }
     const handle = (body.handle ?? "").trim().toLowerCase();
     const secret = body.recovery_secret ?? "";
-    const result = store.recover(handle, secret);
+    const result = await store.recover(handle, secret);
     if (!result) {
       return fail(c, 401, "recover_failed", "Handle or recovery secret did not match.");
     }
@@ -228,14 +240,14 @@ export function createApp(opts: AppOptions): Hono {
     });
   });
 
-  app.get("/v0/handles/me", (c) => {
-    const actor = auth(c);
+  app.get("/v0/handles/me", async (c) => {
+    const actor = await auth(c);
     if (actor instanceof Response) return actor;
-    return c.json(meJson(actor, store));
+    return c.json(meJson(actor));
   });
 
   app.patch("/v0/handles/me", async (c) => {
-    const actor = auth(c);
+    const actor = await auth(c);
     if (actor instanceof Response) return actor;
     let body: { retention?: { enabled?: boolean; ttl_seconds?: number | null } };
     try {
@@ -266,17 +278,17 @@ export function createApp(opts: AppOptions): Hono {
       } else {
         ttl = null;
       }
-      actor.retention = { enabled, ttl_seconds: ttl };
+      await store.setRetention(actor, { enabled, ttl_seconds: ttl });
     }
-    return c.json(meJson(actor, store));
+    return c.json(meJson(actor));
   });
 
-  app.get("/v0/handles/:handle", (c) => {
+  app.get("/v0/handles/:handle", async (c) => {
     const handle = c.req.param("handle").toLowerCase();
     if (!HANDLE_RE.test(handle)) {
       return fail(c, 400, "invalid_handle", "Malformed handle.");
     }
-    const actor = store.byHandle(handle);
+    const actor = await store.byHandle(handle);
     if (!actor) return fail(c, 404, "not_found", "No actor with that handle.");
     return c.json({
       handle: actor.handle,
@@ -288,12 +300,12 @@ export function createApp(opts: AppOptions): Hono {
   });
 
   app.post("/v0/keys/age", async (c) => {
-    const actor = auth(c);
+    const actor = await auth(c);
     if (actor instanceof Response) return actor;
     const body = await readJson<{ public_key?: string }>(c);
     if (body instanceof Response) return body;
     try {
-      store.publishAge(actor, body.public_key ?? "");
+      await store.publishAge(actor, body.public_key ?? "");
     } catch {
       return fail(c, 400, "invalid_age_key", "Expected an age1… recipient string.");
     }
@@ -304,12 +316,12 @@ export function createApp(opts: AppOptions): Hono {
   });
 
   app.post("/v0/keys/signing", async (c) => {
-    const actor = auth(c);
+    const actor = await auth(c);
     if (actor instanceof Response) return actor;
     const body = await readJson<{ public_key?: string }>(c);
     if (body instanceof Response) return body;
     try {
-      store.publishSigning(actor, body.public_key ?? "");
+      await store.publishSigning(actor, body.public_key ?? "");
     } catch {
       return fail(
         c,
@@ -325,7 +337,7 @@ export function createApp(opts: AppOptions): Hono {
   });
 
   app.post("/v0/invites", async (c) => {
-    const actor = auth(c);
+    const actor = await auth(c);
     if (actor instanceof Response) return actor;
     let note: string | undefined;
     try {
@@ -334,7 +346,7 @@ export function createApp(opts: AppOptions): Hono {
     } catch {
       /* empty body is fine */
     }
-    const inv = store.createInvite(actor.actorId, note);
+    const inv = await store.createInvite(actor.actorId, note);
     return c.json(
       {
         invite_id: inv.token,
@@ -346,12 +358,12 @@ export function createApp(opts: AppOptions): Hono {
     );
   });
 
-  app.get("/i/:token", (c) => {
-    const inv = store.getInvite(c.req.param("token"));
+  app.get("/i/:token", async (c) => {
+    const inv = await store.getInvite(c.req.param("token"));
     if (!inv || inv.redeemed || inv.expiresAt <= store.now()) {
       return c.text("Invite unknown, spent, or expired.\n", 404);
     }
-    const issuer = store.byId(inv.fromActorId);
+    const issuer = await store.byId(inv.fromActorId);
     return c.text(
       [
         "Latch invite",
@@ -371,20 +383,20 @@ export function createApp(opts: AppOptions): Hono {
     );
   });
 
-  app.post("/v0/invites/:token/redeem", (c) => {
-    const actor = auth(c);
+  app.post("/v0/invites/:token/redeem", async (c) => {
+    const actor = await auth(c);
     if (actor instanceof Response) return actor;
     try {
-      const grant = store.redeem(c.req.param("token"), actor);
-      const view = store.grantView(grant, actor.actorId);
+      const grant = await store.redeem(c.req.param("token"), actor);
+      const view = await store.grantView(grant, actor.actorId);
+      const peer = await store.byId(view.peer.actor_id);
       return c.json({
         grant_id: grant.id,
         peer: {
           actor_id: view.peer.actor_id,
           handle: view.peer.handle,
-          age_public_key: store.byId(view.peer.actor_id)?.agePublicKey ?? null,
-          signing_public_key:
-            store.byId(view.peer.actor_id)?.signingPublicKey ?? null,
+          age_public_key: peer?.agePublicKey ?? null,
+          signing_public_key: peer?.signingPublicKey ?? null,
         },
       });
     } catch (err) {
@@ -408,32 +420,32 @@ export function createApp(opts: AppOptions): Hono {
     }
   });
 
-  app.get("/v0/grants", (c) => {
-    const actor = auth(c);
+  app.get("/v0/grants", async (c) => {
+    const actor = await auth(c);
     if (actor instanceof Response) return actor;
-    return c.json({ grants: store.listGrants(actor.actorId) });
+    return c.json({ grants: await store.listGrants(actor.actorId) });
   });
 
-  app.post("/v0/grants/:id/repin", (c) => {
-    const actor = auth(c);
+  app.post("/v0/grants/:id/repin", async (c) => {
+    const actor = await auth(c);
     if (actor instanceof Response) return actor;
-    const grant = store.grantById(c.req.param("id"), actor.actorId);
+    const grant = await store.grantById(c.req.param("id"), actor.actorId);
     if (!grant) return fail(c, 404, "not_found", "No such grant.");
-    store.repin(grant, actor.actorId);
-    return c.json(store.grantView(grant, actor.actorId));
+    await store.repin(grant, actor.actorId);
+    return c.json(await store.grantView(grant, actor.actorId));
   });
 
-  app.delete("/v0/grants/:id", (c) => {
-    const actor = auth(c);
+  app.delete("/v0/grants/:id", async (c) => {
+    const actor = await auth(c);
     if (actor instanceof Response) return actor;
-    const grant = store.grantById(c.req.param("id"), actor.actorId);
+    const grant = await store.grantById(c.req.param("id"), actor.actorId);
     if (!grant) return fail(c, 404, "not_found", "No such grant.");
-    store.revoke(grant);
+    await store.revoke(grant);
     return c.json({ revoked: true, grant_id: grant.id });
   });
 
   app.post("/v0/messages", async (c) => {
-    const actor = auth(c);
+    const actor = await auth(c);
     if (actor instanceof Response) return actor;
     const body = await readJson<Partial<Envelope>>(c);
     if (body instanceof Response) return body;
@@ -452,11 +464,11 @@ export function createApp(opts: AppOptions): Hono {
         "Publish Ed25519 and age keys before sending. Persist token and recovery_secret first.",
       );
     }
-    const grant = store.findGrant(env.from, env.to);
+    const grant = await store.findGrant(env.from, env.to);
     if (!grant) {
       return fail(c, 403, "no_grant", "No mutual grant. Exchange an invite first (latch invite / latch redeem).");
     }
-    const view = store.grantView(grant, actor.actorId);
+    const view = await store.grantView(grant, actor.actorId);
     if (view.status === "key_changed") {
       return fail(
         c,
@@ -475,7 +487,7 @@ export function createApp(opts: AppOptions): Hono {
     }
     // Signatures verify against the key the recipient pinned for us, not whatever
     // is published today. status === "active" means they are equal; be explicit.
-    const senderPin = store.pinnedFor(grant, actor.actorId).signing;
+    const senderPin = pinFor(grant, actor.actorId).signing;
     const canonical = canonicalEnvelope({
       v: env.v,
       id: env.id,
@@ -490,7 +502,7 @@ export function createApp(opts: AppOptions): Hono {
     if (!senderPin || !verifyCanonical(senderPin, canonical, env.sig)) {
       return fail(c, 400, "bad_signature", "Envelope sig did not verify against your pinned signing key.");
     }
-    const recipient = store.byId(env.to);
+    const recipient = await store.byId(env.to);
     if (!recipient) {
       return fail(c, 404, "not_found", "Recipient actor does not exist.");
     }
@@ -521,7 +533,7 @@ export function createApp(opts: AppOptions): Hono {
       }
     }
     try {
-      const { message, replayed } = store.enqueue(env);
+      const { message, replayed } = await store.enqueue(env);
       if (!replayed) {
         const dest = recipient.webhook;
         if (dest) {
@@ -529,12 +541,13 @@ export function createApp(opts: AppOptions): Hono {
           const wake = dispatchInboxNew({
             dest,
             to: recipient.actorId,
-            unread: store.unreadCount(recipient.actorId),
+            unread: await store.unreadCount(recipient.actorId),
             now: store.now,
             fetchImpl: opts.fetchImpl,
             retries: opts.webhookRetries ?? 3,
           }).catch((err) => opts.onWebhookError?.(err));
           if (opts.awaitWebhooks) await wake;
+          else opts.waitUntil?.(wake);
         }
       }
       return c.json(
@@ -562,28 +575,27 @@ export function createApp(opts: AppOptions): Hono {
     }
   });
 
-  app.get("/v0/inbox/headers", (c) => {
-    const actor = auth(c);
+  app.get("/v0/inbox/headers", async (c) => {
+    const actor = await auth(c);
     if (actor instanceof Response) return actor;
-    const messages = store.headers(actor.actorId);
+    const messages = await store.headers(actor.actorId);
     return c.json({
-      unread: store.unreadCount(actor.actorId),
+      unread: await store.unreadCount(actor.actorId),
       webhook_connected: Boolean(actor.webhook),
       messages,
     });
   });
 
-  app.get("/v0/inbox/:id", (c) => {
-    const actor = auth(c);
+  app.get("/v0/inbox/:id", async (c) => {
+    const actor = await auth(c);
     if (actor instanceof Response) return actor;
     const id = c.req.param("id");
-    const result = store.open(actor.actorId, id);
+    const result = await store.open(actor.actorId, id);
     if (result === "missing") {
       return fail(c, 404, "not_found", "No such inbox item for this actor.");
     }
-    if (result === "gone") {
-      const m = store.messages.get(id)!;
-      return c.json({ ...store.receipt(m), error: "content_deleted" }, 410);
+    if ("gone" in result) {
+      return c.json({ ...result.gone, error: "content_deleted" }, 410);
     }
     return c.json({
       ...result.envelope,
@@ -591,10 +603,10 @@ export function createApp(opts: AppOptions): Hono {
     });
   });
 
-  app.post("/v0/inbox/:id/ack", (c) => {
-    const actor = auth(c);
+  app.post("/v0/inbox/:id/ack", async (c) => {
+    const actor = await auth(c);
     if (actor instanceof Response) return actor;
-    const result = store.ack(actor.actorId, c.req.param("id"));
+    const result = await store.ack(actor.actorId, c.req.param("id"));
     if (result === "missing") {
       return fail(c, 404, "not_found", "No such inbox item for this actor.");
     }
@@ -602,7 +614,7 @@ export function createApp(opts: AppOptions): Hono {
   });
 
   app.put("/v0/notifications", async (c) => {
-    const actor = auth(c);
+    const actor = await auth(c);
     if (actor instanceof Response) return actor;
     const body = await readJson<{
       url?: string;
@@ -615,20 +627,20 @@ export function createApp(opts: AppOptions): Hono {
     if ("error" in dest) {
       return fail(c, 400, dest.error, dest.hint);
     }
-    store.setWebhook(actor, dest);
+    await store.setWebhook(actor, dest);
     return c.json(publicWebhookView(actor.webhook));
   });
 
-  app.get("/v0/notifications", (c) => {
-    const actor = auth(c);
+  app.get("/v0/notifications", async (c) => {
+    const actor = await auth(c);
     if (actor instanceof Response) return actor;
     return c.json(publicWebhookView(actor.webhook));
   });
 
-  app.delete("/v0/notifications", (c) => {
-    const actor = auth(c);
+  app.delete("/v0/notifications", async (c) => {
+    const actor = await auth(c);
     if (actor instanceof Response) return actor;
-    store.clearWebhook(actor);
+    await store.clearWebhook(actor);
     return c.json({ connected: false });
   });
 
@@ -656,7 +668,7 @@ export function createApp(opts: AppOptions): Hono {
       }
     }
     const handle = (body.handle ?? "").trim().toLowerCase();
-    if (store.byHandle(handle)) {
+    if (await store.byHandle(handle)) {
       return fail(
         c,
         409,
@@ -671,8 +683,8 @@ export function createApp(opts: AppOptions): Hono {
       dest = parsed;
     }
     try {
-      const { actor, token, recovery_secret } = store.claim(handle);
-      if (dest) store.setWebhook(actor, dest);
+      const { actor, token, recovery_secret } = await store.claim(handle);
+      if (dest) await store.setWebhook(actor, dest);
       return c.json(
         {
           actor_id: actor.actorId,
@@ -695,7 +707,7 @@ export function createApp(opts: AppOptions): Hono {
           "3–32 chars, lowercase a-z 0-9, single hyphens inside.",
         );
       }
-      if (code === "handle_taken") {
+      if (code === "handle_taken" || code === "handle_reserved") {
         return fail(
           c,
           409,
@@ -717,7 +729,7 @@ export function createApp(opts: AppOptions): Hono {
       return fail(c, 400, "invalid_json", "JSON body required.");
     }
     const handle = (body.handle ?? "").trim().toLowerCase();
-    const result = store.reclaim(handle, body.reset_token ?? "");
+    const result = await store.reclaim(handle, body.reset_token ?? "");
     if (!result) {
       return fail(
         c,
@@ -737,17 +749,17 @@ export function createApp(opts: AppOptions): Hono {
     });
   });
 
-  app.get("/v0/ops/agents", (c) => {
+  app.get("/v0/ops/agents", async (c) => {
     const ok = opsAuth(c, opts.opsSecret);
     if (ok instanceof Response) return ok;
-    return c.json({ agents: store.listAgentsPublic() });
+    return c.json({ agents: await store.listAgentsPublic() });
   });
 
-  app.post("/v0/ops/agents/:handle/reset-credentials", (c) => {
+  app.post("/v0/ops/agents/:handle/reset-credentials", async (c) => {
     const ok = opsAuth(c, opts.opsSecret);
     if (ok instanceof Response) return ok;
     try {
-      const issued = store.issueReset(c.req.param("handle").toLowerCase());
+      const issued = await store.issueReset(c.req.param("handle").toLowerCase());
       return c.json({
         handle: issued.actor.handle,
         reset_token: issued.reset_token,
@@ -763,20 +775,27 @@ export function createApp(opts: AppOptions): Hono {
     }
   });
 
-  app.delete("/v0/ops/agents/:handle", (c) => {
+  app.delete("/v0/ops/agents/:handle", async (c) => {
     const ok = opsAuth(c, opts.opsSecret);
     if (ok instanceof Response) return ok;
     const handle = c.req.param("handle").toLowerCase();
-    if (!store.deleteHandle(handle)) {
+    if (!await store.deleteHandle(handle)) {
       return fail(c, 404, "not_found", "No actor with that handle.");
     }
     return c.json({ deleted: true, handle });
   });
 
+  registerOwnerRoutes(app, {
+    verify: async () => null,
+    ...opts.owner,
+    store,
+    publicBase,
+  });
+
   return app;
 }
 
-function meJson(actor: Actor, store: MemoryStore) {
+function meJson(actor: Actor) {
   return {
     actor_id: actor.actorId,
     handle: actor.handle,

@@ -12,7 +12,6 @@ import {
   INVITE_TTL_MS,
   RESET_TTL_MS,
   UNREAD_TTL_MS,
-  type AuthMode,
   type Envelope,
   type GrantView,
   type InboxHeader,
@@ -22,61 +21,39 @@ import {
   isAgeArmored,
 } from "./types.js";
 import type { WebhookDest } from "./webhooks.js";
+import {
+  AGE_KEY_RE,
+  computeGrantView,
+  grantStatus,
+  pinFor,
+  SIGNING_KEY_RE,
+  storeError,
+  type Actor,
+  type AgentPublic,
+  type Grant,
+  type Invite,
+  type Profile,
+  type Reservation,
+  type ResetTicket,
+  type Retention,
+  type Store,
+  type StoredMessage,
+} from "./store-types.js";
 
-export type Retention = {
-  enabled: boolean;
-  ttl_seconds: number | null;
-};
-
-export type Actor = {
-  actorId: string;
-  handle: string;
-  tokenHash: string;
-  recoveryHash: string;
-  agePublicKey?: string;
-  signingPublicKey?: string;
-  retention: Retention;
-  createdAt: number;
-  webhook?: WebhookDest;
-};
-
-export type Invite = {
-  token: string;
-  fromActorId: string;
-  note?: string;
-  expiresAt: number;
-  redeemed: boolean;
-};
-
-export type Grant = {
-  id: string;
-  a: string;
-  b: string;
-  pinA: { age?: string; signing?: string };
-  pinB: { age?: string; signing?: string };
-  createdAt: number;
-  revoked: boolean;
-};
-
-export type StoredMessage = {
-  envelope: Envelope;
-  queuedAt: number;
-  expiresAt: number;
-  openedAt?: number;
-  ackedAt?: number;
-  expiredAt?: number;
-  bytes: number;
-  status: "queued" | "opened" | "acked" | "expired";
-  payload: string | null;
-};
-
-export type ResetTicket = {
-  tokenHash: string;
-  handle: string;
-  actorId: string;
-  expiresAt: number;
-  spent: boolean;
-};
+export type {
+  Actor,
+  AgentPublic,
+  Grant,
+  Invite,
+  OpenResult,
+  Pin,
+  Profile,
+  Reservation,
+  ResetTicket,
+  Retention,
+  Store,
+  StoredMessage,
+} from "./store-types.js";
 
 export type Clock = () => number;
 
@@ -90,19 +67,25 @@ export class MemoryStore {
   /** from+id → message id */
   idempotency = new Map<string, string>();
   resetTickets = new Map<string, ResetTicket>();
+  /** handle → reservation */
+  reservations = new Map<string, Reservation>();
+  /** owner id → profile */
+  profiles = new Map<string, Profile>();
 
   constructor(public now: Clock = () => Date.now()) {}
 
   claim(
     handle: string,
-    recovery?: string,
+    opts: { recovery?: string; setupCodeHash?: string } = {},
   ): { actor: Actor; token: string; recovery_secret: string } {
-    if (!HANDLE_RE.test(handle)) {
-      throw Object.assign(new Error("invalid_handle"), { code: "invalid_handle" });
+    const { recovery, setupCodeHash } = opts;
+    if (!HANDLE_RE.test(handle)) throw storeError("invalid_handle");
+    if (this.actorsByHandle.has(handle)) throw storeError("handle_taken");
+    const r = this.liveReservation(handle);
+    if (setupCodeHash !== undefined && (!r || r.codeHash !== setupCodeHash)) {
+      throw storeError("bad_setup_code");
     }
-    if (this.actorsByHandle.has(handle)) {
-      throw Object.assign(new Error("handle_taken"), { code: "handle_taken" });
-    }
+    if (r && setupCodeHash === undefined) throw storeError("handle_reserved");
     const token = bearerToken();
     const recovery_secret =
       recovery && recovery.length >= 16 ? recovery : recoverySecret();
@@ -115,6 +98,10 @@ export class MemoryStore {
       retention: { enabled: false, ttl_seconds: null },
       createdAt: this.now(),
     };
+    if (r) {
+      actor.ownerId = r.ownerId;
+      this.reservations.delete(handle);
+    }
     this.actors.set(id, actor);
     this.actorsByHandle.set(handle, id);
     this.actorsByTokenHash.set(actor.tokenHash, id);
@@ -152,21 +139,19 @@ export class MemoryStore {
   }
 
   publishAge(actor: Actor, publicKey: string): void {
-    if (!/^age1[0-9a-z]{58}$/.test(publicKey)) {
-      throw Object.assign(new Error("invalid_age_key"), { code: "invalid_age_key" });
-    }
+    if (!AGE_KEY_RE.test(publicKey)) throw storeError("invalid_age_key");
     actor.agePublicKey = publicKey;
     this.fillEmptyPins(actor, "age", publicKey);
   }
 
   publishSigning(actor: Actor, publicKey: string): void {
-    if (!/^ed25519:[A-Za-z0-9_-]{43}$/.test(publicKey)) {
-      throw Object.assign(new Error("invalid_signing_key"), {
-        code: "invalid_signing_key",
-      });
-    }
+    if (!SIGNING_KEY_RE.test(publicKey)) throw storeError("invalid_signing_key");
     actor.signingPublicKey = publicKey;
     this.fillEmptyPins(actor, "signing", publicKey);
+  }
+
+  setRetention(actor: Actor, retention: Retention): void {
+    actor.retention = retention;
   }
 
   /**
@@ -248,45 +233,19 @@ export class MemoryStore {
     return grant;
   }
 
-  peerKeyChanged(grant: Grant, peerId: string): boolean {
-    const peer = this.actors.get(peerId);
-    if (!peer) return true;
-    const pin = peerId === grant.a ? grant.pinA : grant.pinB;
-    return pin.age !== peer.agePublicKey || pin.signing !== peer.signingPublicKey;
-  }
-
-  /**
-   * Status from the viewer's side. `key_changed`: the peer's keys moved and the
-   * viewer must re-verify and repin. `awaiting_peer_repin`: the viewer's own keys
-   * moved and the peer has to repin. Mail is blocked both ways in either state.
-   */
   grantStatus(grant: Grant, viewerId: string): GrantView["status"] {
     const peerId = grant.a === viewerId ? grant.b : grant.a;
-    if (this.peerKeyChanged(grant, peerId)) return "key_changed";
-    if (this.peerKeyChanged(grant, viewerId)) return "awaiting_peer_repin";
-    return "active";
+    return grantStatus(grant, viewerId, this.actors.get(viewerId), this.actors.get(peerId));
   }
 
   /** The key the peer pinned for `actorId` — what their signatures must verify against. */
   pinnedFor(grant: Grant, actorId: string): { age?: string; signing?: string } {
-    return actorId === grant.a ? grant.pinA : grant.pinB;
+    return pinFor(grant, actorId);
   }
 
   grantView(grant: Grant, viewerId: string): GrantView {
     const peerId = grant.a === viewerId ? grant.b : grant.a;
-    const peer = this.actors.get(peerId);
-    const pin = peerId === grant.a ? grant.pinA : grant.pinB;
-    return {
-      grant_id: grant.id,
-      peer: {
-        actor_id: peerId,
-        handle: peer?.handle ?? "unknown",
-      },
-      pinned_age_key: pin.age,
-      pinned_signing_key: pin.signing,
-      status: this.grantStatus(grant, viewerId),
-      created_at: new Date(grant.createdAt).toISOString(),
-    };
+    return computeGrantView(grant, viewerId, this.actors.get(viewerId), this.actors.get(peerId));
   }
 
   listGrants(viewerId: string): GrantView[] {
@@ -525,16 +484,63 @@ export class MemoryStore {
     return true;
   }
 
-  listAgentsPublic(): Array<{
-    handle: string;
-    actor_id: string;
-    webhook_connected: boolean;
-    webhook_url?: string;
-    auth_mode?: AuthMode;
-    age_published: boolean;
-    signing_published: boolean;
-    keys_ready: boolean;
-  }> {
+  private liveReservation(handle: string): Reservation | undefined {
+    const r = this.reservations.get(handle);
+    if (r && r.expiresAt <= this.now()) {
+      this.reservations.delete(handle);
+      return undefined;
+    }
+    return r;
+  }
+
+  handleAvailability(handle: string): { available: boolean; reason?: "invalid" | "taken" | "reserved" } {
+    if (!HANDLE_RE.test(handle)) return { available: false, reason: "invalid" };
+    if (this.actorsByHandle.has(handle)) return { available: false, reason: "taken" };
+    if (this.liveReservation(handle)) return { available: false, reason: "reserved" };
+    return { available: true };
+  }
+
+  /** Reserve (or re-reserve, for the same owner) a free handle. */
+  reserveHandle(r: Reservation): void {
+    if (!HANDLE_RE.test(r.handle)) throw storeError("invalid_handle");
+    if (this.actorsByHandle.has(r.handle)) throw storeError("handle_taken");
+    const existing = this.liveReservation(r.handle);
+    if (existing && existing.ownerId !== r.ownerId) throw storeError("handle_taken");
+    this.reservations.set(r.handle, { ...r });
+  }
+
+  cancelReservation(handle: string, ownerId: string): boolean {
+    const r = this.reservations.get(handle);
+    if (!r || r.ownerId !== ownerId) return false;
+    this.reservations.delete(handle);
+    return true;
+  }
+
+  listReservations(ownerId: string): Reservation[] {
+    return [...this.reservations.values()]
+      .filter((r) => r.ownerId === ownerId && r.expiresAt > this.now())
+      .sort((a, b) => a.handle.localeCompare(b.handle));
+  }
+
+  listOwnedActors(ownerId: string): Actor[] {
+    return [...this.actors.values()]
+      .filter((a) => a.ownerId === ownerId)
+      .sort((a, b) => a.createdAt - b.createdAt);
+  }
+
+  getProfile(ownerId: string): Profile {
+    return { ...(this.profiles.get(ownerId) ?? { display_name: null, onboarded_at: null }) };
+  }
+
+  updateProfile(ownerId: string, patch: { display_name?: string; onboarded?: boolean }): Profile {
+    const p = this.getProfile(ownerId);
+    if (patch.display_name !== undefined) p.display_name = patch.display_name;
+    if (patch.onboarded && !p.onboarded_at) p.onboarded_at = new Date(this.now()).toISOString();
+    this.profiles.set(ownerId, p);
+    return { ...p };
+  }
+
+  listAgentsPublic(): AgentPublic[] {
     return [...this.actors.values()]
       .sort((a, b) => a.handle.localeCompare(b.handle))
       .map((a) => ({
@@ -558,6 +564,8 @@ export type Snapshot = {
   messages: StoredMessage[];
   idempotency: Array<[string, string]>;
   resetTickets: Array<[string, ResetTicket]>;
+  reservations?: Reservation[];
+  profiles?: Array<[string, Profile]>;
 };
 
 export function snapshotStore(store: MemoryStore): Snapshot {
@@ -569,6 +577,8 @@ export function snapshotStore(store: MemoryStore): Snapshot {
     messages: [...store.messages.values()],
     idempotency: [...store.idempotency.entries()],
     resetTickets: [...store.resetTickets.entries()],
+    reservations: [...store.reservations.values()],
+    profiles: [...store.profiles.entries()],
   };
 }
 
@@ -584,6 +594,55 @@ export function restoreStore(store: MemoryStore, snap: Snapshot): void {
   for (const m of snap.messages) store.messages.set(m.envelope.id, m);
   for (const [k, v] of snap.idempotency) store.idempotency.set(k, v);
   for (const [k, v] of snap.resetTickets) store.resetTickets.set(k, v);
+  for (const r of snap.reservations ?? []) store.reservations.set(r.handle, r);
+  for (const [k, v] of snap.profiles ?? []) store.profiles.set(k, v);
+}
+
+/** The async Store view of a MemoryStore (what the HTTP app talks to). */
+export function asyncStore(mem: MemoryStore): Store {
+  const p = <T>(v: T) => Promise.resolve(v);
+  return {
+    now: () => mem.now(),
+    claim: async (handle, opts) => mem.claim(handle, opts),
+    recover: async (handle, secret) => mem.recover(handle, secret),
+    byToken: async (token) => mem.byToken(token),
+    byHandle: async (handle) => mem.byHandle(handle),
+    byId: async (id) => mem.byId(id),
+    publishAge: async (actor, key) => mem.publishAge(actor, key),
+    publishSigning: async (actor, key) => mem.publishSigning(actor, key),
+    setRetention: async (actor, r) => mem.setRetention(actor, r),
+    createInvite: async (from, note) => mem.createInvite(from, note),
+    getInvite: async (token) => mem.getInvite(token),
+    redeem: async (token, redeemer) => mem.redeem(token, redeemer),
+    findGrant: async (a, b) => mem.findGrant(a, b),
+    grantById: async (id, viewer) => mem.grantById(id, viewer),
+    grantView: async (g, viewer) => mem.grantView(g, viewer),
+    listGrants: async (viewer) => mem.listGrants(viewer),
+    repin: async (g, viewer) => mem.repin(g, viewer),
+    revoke: async (g) => mem.revoke(g),
+    enqueue: async (env) => mem.enqueue(env),
+    unreadCount: async (id) => mem.unreadCount(id),
+    headers: async (id, limit) => mem.headers(id, limit),
+    open: async (actorId, id) => {
+      const r = mem.open(actorId, id);
+      return r === "gone" ? { gone: mem.receipt(mem.messages.get(id)!) } : r;
+    },
+    ack: async (actorId, id) => mem.ack(actorId, id),
+    expireDue: async () => mem.expireDue(),
+    setWebhook: async (actor, dest) => mem.setWebhook(actor, dest),
+    clearWebhook: async (actor) => mem.clearWebhook(actor),
+    issueReset: async (handle) => mem.issueReset(handle),
+    reclaim: async (handle, raw) => mem.reclaim(handle, raw),
+    deleteHandle: async (handle) => mem.deleteHandle(handle),
+    listAgentsPublic: async () => mem.listAgentsPublic(),
+    handleAvailability: async (handle) => mem.handleAvailability(handle),
+    reserveHandle: async (r) => mem.reserveHandle(r),
+    cancelReservation: async (handle, owner) => mem.cancelReservation(handle, owner),
+    listReservations: async (owner) => mem.listReservations(owner),
+    listOwnedActors: async (owner) => mem.listOwnedActors(owner),
+    getProfile: (owner) => p(mem.getProfile(owner)),
+    updateProfile: async (owner, patch) => mem.updateProfile(owner, patch),
+  };
 }
 
 export function codeOf(err: unknown): string | undefined {

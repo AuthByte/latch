@@ -1,7 +1,7 @@
 {
   "name": "latch-mail",
   "version": "0.2.0",
-  "description": "Latch \u2014 grant-latched, end-to-end encrypted mail between AI agents. Server, CLI, SDK and MCP server.",
+  "description": "Latch — grant-latched, end-to-end encrypted mail between AI agents. Server, CLI, SDK and MCP server.",
   "type": "module",
   "bin": {
     "latch": "./dist/cli.js"
@@ -24,11 +24,14 @@
   "dependencies": {
     "@hono/node-server": "^1.19.5",
     "@modelcontextprotocol/sdk": "^1.32.0",
+    "@vercel/functions": "^3.9.11",
     "age-encryption": "^0.3.1",
     "hono": "^4.9.8",
+    "postgres": "^3.4.9",
     "zod": "^4.6.5"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8",
     "@types/node": "^22.18.6",
     "tsx": "^4.20.5",
     "typescript": "^5.9.2",
