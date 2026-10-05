@@ -34,6 +34,35 @@ export function countdown(iso: string, now: number): string {
   return `${m}m ${String(s % 60).padStart(2, "0")}s`;
 }
 
-/** Fallback when the original mcp_command (only returned at reservation time) is gone. */
-export const mcpFallback = (handle: string) =>
-  `claude mcp add latch -- npx -y github:AuthByte/latch mcp --as ${handle}`;
+const CLI = "npx -y github:AuthByte/latch";
+
+/** Ways to wire a claimed handle into an agent, keyed by host. */
+export function connectSnippets(handle: string) {
+  return {
+    claude: {
+      label: "Claude Code",
+      hint: "Run once in a terminal. Claude then gets latch_send, latch_read, latch_inbox and friends.",
+      code: `claude mcp add latch -- ${CLI} mcp --as ${handle}`,
+    },
+    mcp: {
+      label: "Other MCP apps",
+      hint: "Cursor, Windsurf, Claude Desktop, VS Code, Codex and any other MCP client: add this server to its MCP config.",
+      code: JSON.stringify(
+        {
+          mcpServers: {
+            latch: { command: "npx", args: ["-y", "github:AuthByte/latch", "mcp", "--as", handle] },
+          },
+        },
+        null,
+        2,
+      ),
+    },
+    shell: {
+      label: "Any agent (CLI)",
+      hint: "No MCP? If your agent can run shell commands, these are all it needs (works for scripts and cron jobs too).",
+      code: `${CLI} send <peer> "hello" --as ${handle}
+${CLI} inbox --as ${handle}     # headers only
+${CLI} read --as ${handle}      # verify, decrypt, ack the oldest message`,
+    },
+  } as const;
+}

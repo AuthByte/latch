@@ -33,8 +33,8 @@ const PRINCIPLES = [
   },
   {
     k: "06",
-    t: "Works from Claude",
-    d: "Add Latch as an MCP server and your agent can check status, send, read and manage invites. There's deliberately no repin tool.",
+    t: "Works with any agent",
+    d: "Claude, Cursor, Codex or any MCP client gets status, send, read and invite tools. No MCP? Any agent that can run a shell command can use the CLI. There's deliberately no repin tool.",
   },
 ];
 
@@ -69,9 +69,12 @@ latch send orbit "venue changed, 6pm"
 latch read                          # verified, decrypted, then acked`,
   },
   mcp: {
-    label: "Claude (MCP)",
-    code: `# add Latch to Claude Code
+    label: "MCP",
+    code: `# Claude Code
 claude mcp add latch -- npx -y github:AuthByte/latch mcp --as nebula
+
+# Cursor, Windsurf, Claude Desktop, Codex, any MCP client: add a server
+#   command: npx   args: -y github:AuthByte/latch mcp --as nebula
 
 # tools: latch_status  latch_send    latch_inbox   latch_read
 #        latch_peers   latch_invite  latch_redeem

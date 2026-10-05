@@ -10,7 +10,7 @@ import {
   type SetupCode,
 } from "../api";
 import { useAction, useDebounced, useNow, usePoll } from "../hooks";
-import { countdown, handleProblem, mcpFallback } from "../lib";
+import { connectSnippets, countdown, handleProblem } from "../lib";
 import { useMe } from "../me";
 import { CopyField, ErrorNote, InfoNote, Spinner } from "./ui";
 
@@ -100,16 +100,49 @@ function HandleInput({ value, onChange, check }: { value: string; onChange: (v: 
   );
 }
 
+/** Step 2: wire the claimed handle into whatever agent the owner runs. */
+export function ConnectAgent({ handle }: { handle: string }) {
+  const snippets = connectSnippets(handle);
+  const keys = Object.keys(snippets) as (keyof typeof snippets)[];
+  const [tab, setTab] = useState<(typeof keys)[number]>("claude");
+  const id = useId();
+  const cur = snippets[tab];
+  return (
+    <div className="copyfield">
+      <div className="copyfield-head">
+        <span className="label">2. Connect it to your agent, after claiming</span>
+      </div>
+      <div className="tabs" role="tablist" aria-label="Agent type">
+        {keys.map((k) => (
+          <button
+            key={k}
+            type="button"
+            role="tab"
+            id={`${id}-${k}`}
+            aria-selected={tab === k}
+            aria-controls={`${id}-panel`}
+            className={tab === k ? "tab on" : "tab"}
+            onClick={() => setTab(k)}
+          >
+            {snippets[k].label}
+          </button>
+        ))}
+      </div>
+      <div role="tabpanel" id={`${id}-panel`} aria-labelledby={`${id}-${tab}`}>
+        <CopyField label={tab === "mcp" ? "MCP config (JSON)" : "Command"} value={cur.code} hint={cur.hint} />
+      </div>
+    </div>
+  );
+}
+
 export function PendingCard({
   pending,
-  mcp,
   command,
   claimed,
   onCancelled,
   onNewCode,
 }: {
   pending: Pending;
-  mcp?: string;
   /** The real claim command (with the setup code); only known right after reserving. */
   command?: string;
   claimed?: boolean;
@@ -153,11 +186,7 @@ export function PendingCard({
               </button>
             </InfoNote>
           )}
-          <CopyField
-            label="2. Connect it to Claude (MCP), after claiming"
-            value={mcp ?? mcpFallback(pending.handle)}
-            hint={mcp ? undefined : "Standard MCP command; adjust the path if you installed Latch elsewhere."}
-          />
+          <ConnectAgent handle={pending.handle} />
           <p className="waiting" aria-live="polite">
             <Spinner label="Waiting for keys" />
             {claimed ? "Claimed. Waiting for keys to be published…" : "Waiting for your agent to claim and publish keys…"}
@@ -252,7 +281,6 @@ export function ReserveAgent({ singleReservation = false, onReady, submitLabel =
         <PendingCard
           key={p.handle}
           pending={p}
-          mcp={fresh[p.handle]?.mcp_command}
           command={fresh[p.handle]?.command}
           onNewCode={() => void reserve.run(p.handle)}
           claimed={agentHandles.has(p.handle)}

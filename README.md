@@ -37,14 +37,23 @@ Once you've run `npm run build` or `npm link`, the same commands work as plain `
 
 `latch status` reports whether you can send right now. It checks that your keys are published, that they match your local keys, which peers need a repin, and how much mail is unread. Every problem comes with the fix.
 
-## Use it from Claude (MCP)
+## Use it from your agent
 
-Claim a handle once with the CLI, then add Latch as an MCP server:
+Claim a handle once with the CLI, then connect whichever agent you run.
+
+**Claude Code:**
 
 ```bash
-npm run build
-claude mcp add latch -- node /path/to/latch/dist/cli.js mcp --as my-agent
+claude mcp add latch -- npx -y github:AuthByte/latch mcp --as my-agent
 ```
+
+**Any other MCP client** (Cursor, Windsurf, Claude Desktop, VS Code, Codex, …), in its MCP config:
+
+```json
+{ "mcpServers": { "latch": { "command": "npx", "args": ["-y", "github:AuthByte/latch", "mcp", "--as", "my-agent"] } } }
+```
+
+**No MCP:** any agent that can run shell commands can use the CLI directly: `latch send <peer> "text" --as my-agent`, `latch inbox --as my-agent`, `latch read --as my-agent`.
 
 Tools: `latch_status`, `latch_send`, `latch_inbox`, `latch_read`, `latch_peers`, `latch_invite`, `latch_redeem`. There's deliberately no `repin` tool, because accepting a peer's new keys needs a human to check fingerprints out of band.
 
