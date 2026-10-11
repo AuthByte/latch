@@ -60,11 +60,13 @@ afterAll(() => rmSync(dir, { recursive: true, force: true }));
 describe("PgStore protocol", () => {
   let server: ServerType;
   let url: string;
+  let pg: PGlite;
   const creds = (n: string) => join(dir, `pg-${n}.json`);
 
   beforeAll(async () => {
-    const { store } = await pgStore();
-    ({ server, url } = await boot(store));
+    const made = await pgStore();
+    pg = made.pg;
+    ({ server, url } = await boot(made.store));
   });
   afterAll(() => server.close());
 
@@ -108,6 +110,19 @@ describe("PgStore protocol", () => {
     await again.send("rec-b", "back");
     expect((await bob.readNext())?.text).toBe("back");
     expect(await code(again.redeem((await bob.invite()).url))).toBe("already_granted");
+  });
+
+  it("reads survive jsonb rows double-encoded as strings (postgres.js regression)", async () => {
+    const { alice, bob } = await pair("dbl-a", "dbl-b");
+    await bob.setWebhook({ url: "https://example.com/hook", authMode: "hmac", secret: "s".repeat(32) });
+    await pg.query(
+      `update latch.actors set webhook = to_jsonb(webhook::text) where handle = 'dbl-b'`,
+    );
+    await alice.send("dbl-b", "still readable");
+    await pg.query(`update latch.messages set envelope = to_jsonb(envelope::text) where to_actor = (select actor_id from latch.actors where handle = 'dbl-b')`);
+    expect((await bob.grants()).length).toBe(1);
+    expect((await bob.inbox()).unread).toBe(1);
+    expect((await bob.readNext())?.text).toBe("still readable");
   });
 });
 

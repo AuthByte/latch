@@ -77,6 +77,8 @@ export function pgliteDb(pg: PgliteLike): Db {
 const ms = (d: Date | string | null | undefined): number | undefined =>
   d == null ? undefined : new Date(d).getTime();
 const ts = (n: number): string => new Date(n).toISOString();
+/** jsonb read back; tolerates rows double-encoded as a JSON string. */
+const json = <T>(v: unknown): T => (typeof v === "string" ? JSON.parse(v) : v) as T;
 const isUnique = (err: unknown) =>
   Boolean(err && typeof err === "object" && (err as { code?: string }).code === "23505");
 
@@ -91,7 +93,7 @@ function toActor(r: Row): Actor {
   };
   if (r.age_public_key) a.agePublicKey = r.age_public_key;
   if (r.signing_public_key) a.signingPublicKey = r.signing_public_key;
-  if (r.webhook) a.webhook = r.webhook as WebhookDest;
+  if (r.webhook) a.webhook = json<WebhookDest>(r.webhook);
   if (r.owner_id) a.ownerId = r.owner_id;
   return a;
 }
@@ -114,7 +116,7 @@ function toGrant(r: Row): Grant {
 
 function toMessage(r: Row): StoredMessage {
   return {
-    envelope: r.envelope as Envelope,
+    envelope: json<Envelope>(r.envelope),
     queuedAt: ms(r.queued_at)!,
     expiresAt: ms(r.expires_at)!,
     openedAt: ms(r.opened_at),
@@ -356,7 +358,7 @@ export class PgStore implements Store {
     const actors = new Map(
       (
         await this.db.query(
-          `select * from latch.actors where actor_id in (select jsonb_array_elements_text($1::jsonb))`,
+          `select * from latch.actors where actor_id in (select jsonb_array_elements_text($1::text::jsonb))`,
           [JSON.stringify(ids)],
         )
       ).map((r) => [r.actor_id as string, toActor(r)]),
@@ -429,7 +431,7 @@ export class PgStore implements Store {
     try {
       await this.db.query(
         `insert into latch.messages (id, from_actor, to_actor, envelope, payload, bytes, status, queued_at, expires_at)
-         values ($1, $2, $3, $4::jsonb, $5, $6, 'queued', $7::timestamptz, $8::timestamptz)`,
+         values ($1, $2, $3, $4::text::jsonb, $5, $6, 'queued', $7::timestamptz, $8::timestamptz)`,
         [
           envelope.id,
           envelope.from,
@@ -525,7 +527,7 @@ export class PgStore implements Store {
   }
 
   async setWebhook(actor: Actor, dest: WebhookDest): Promise<void> {
-    await this.db.query(`update latch.actors set webhook = $2::jsonb where actor_id = $1`, [
+    await this.db.query(`update latch.actors set webhook = $2::text::jsonb where actor_id = $1`, [
       actor.actorId,
       JSON.stringify(dest),
     ]);
