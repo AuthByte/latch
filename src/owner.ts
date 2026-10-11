@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import type { Hono, Context } from "hono";
 import { sha256hex } from "./crypto.js";
-import { HANDLE_RE } from "./ids.js";
+import { AGENT_NAME_RE, HANDLE_RE, splitHandle } from "./ids.js";
 import { codeOf } from "./store.js";
 import { fingerprintsOf, type Actor, type Store } from "./store-types.js";
 import { publicWebhookView } from "./webhooks.js";
@@ -145,6 +145,19 @@ export function registerOwnerRoutes(app: Hono, opts: OwnerOptions): void {
     return c.json({ handle, ...(await store.handleAvailability(handle)) });
   });
 
+  app.get("/v0/connection-invites/:token", async (c) => {
+    const inv = await store.getConnectionInvite(c.req.param("token"));
+    if (!inv || inv.accepted || inv.expiresAt <= store.now()) return c.json({ valid: false });
+    const from = await store.getProfile(inv.fromOwner);
+    return c.json({
+      valid: true,
+      from_username: from.username,
+      from_name: from.display_name,
+      note: inv.note,
+      expires_at: new Date(inv.expiresAt).toISOString(),
+    });
+  });
+
   app.get("/v0/invites/:token", async (c) => {
     const inv = await store.getInvite(c.req.param("token"));
     if (!inv || inv.redeemed || inv.expiresAt <= store.now()) return c.json({ valid: false });
@@ -162,16 +175,19 @@ export function registerOwnerRoutes(app: Hono, opts: OwnerOptions): void {
   app.get("/v0/owner/me", async (c) => {
     const user = await owner(c);
     if (user instanceof Response) return user;
-    const [profile, actors, pending] = await Promise.all([
+    const [profile, actors, pending, connections] = await Promise.all([
       store.getProfile(user.id),
       store.listOwnedActors(user.id),
       store.listReservations(user.id),
+      store.listConnections(user.id),
     ]);
     return c.json({
       user_id: user.id,
       email: user.email,
       profile,
+      username: profile.username,
       agents: await Promise.all(actors.map(agentJson)),
+      connections,
       pending: pending.map((r) => ({
         handle: r.handle,
         expires_at: new Date(r.expiresAt).toISOString(),
@@ -195,14 +211,51 @@ export function registerOwnerRoutes(app: Hono, opts: OwnerOptions): void {
     return c.json({ profile: await store.updateProfile(user.id, patch) });
   });
 
+  app.get("/v0/usernames/:name/availability", async (c) => {
+    const user = await owner(c);
+    if (user instanceof Response) return user;
+    const name = c.req.param("name").toLowerCase();
+    return c.json({ username: name, ...(await store.usernameAvailability(name, user.id)) });
+  });
+
+  app.put("/v0/owner/username", async (c) => {
+    const user = await owner(c);
+    if (user instanceof Response) return user;
+    const b = await body<{ username?: unknown }>(c);
+    const name = typeof b.username === "string" ? b.username.trim().toLowerCase().replace(/^@/, "") : "";
+    try {
+      const result = await store.setUsername(user.id, name);
+      return c.json({ ...result, profile: await store.getProfile(user.id) });
+    } catch (err) {
+      const code = codeOf(err);
+      if (code === "invalid_username") {
+        return fail(c, 400, code, "3–32 chars, lowercase a-z 0-9, single hyphens inside.");
+      }
+      if (code === "username_taken") return fail(c, 409, code, "That username is taken. Try another.");
+      if (code === "username_set") return fail(c, 409, code, "Your username is already set and can't be changed.");
+      throw err;
+    }
+  });
+
   app.post("/v0/owner/setup-codes", async (c) => {
     const user = await owner(c);
     if (user instanceof Response) return user;
-    const b = await body<{ handle?: unknown }>(c);
-    const handle = typeof b.handle === "string" ? b.handle.trim().toLowerCase() : "";
-    if (!HANDLE_RE.test(handle)) {
-      return fail(c, 400, "invalid_handle", "3–32 chars, lowercase a-z 0-9, single hyphens inside.");
+    const { username } = await store.getProfile(user.id);
+    if (!username) {
+      return fail(c, 409, "username_required", "Pick your username first. Agents live under it, like you.agent.");
     }
+    // Accept the agent part ("capy") or the full handle ("nebula.capy").
+    const b = await body<{ name?: unknown; handle?: unknown }>(c);
+    const raw = typeof b.name === "string" ? b.name : typeof b.handle === "string" ? b.handle : "";
+    const parts = splitHandle(raw.trim().toLowerCase().replace(/^@/, ""));
+    if (parts.owner !== undefined && parts.owner !== username) {
+      return fail(c, 400, "not_your_namespace", `Your agents live under ${username}.`);
+    }
+    if (!AGENT_NAME_RE.test(parts.name)) {
+      return fail(c, 400, "invalid_handle", "Agent name: 1–32 chars, lowercase a-z 0-9, single hyphens inside.");
+    }
+    const handle = `${username}.${parts.name}`;
+    if (!HANDLE_RE.test(handle)) return fail(c, 400, "invalid_handle", "Malformed handle.");
     const code = `lsc_${randomBytes(16).toString("hex")}`;
     const expiresAt = store.now() + SETUP_CODE_TTL_MS;
     try {
@@ -210,6 +263,7 @@ export function registerOwnerRoutes(app: Hono, opts: OwnerOptions): void {
     } catch (err) {
       if (codeOf(err) === "handle_taken") return fail(c, 409, "handle_taken", "That handle is taken. Try another.");
       if (codeOf(err) === "invalid_handle") return fail(c, 400, "invalid_handle", "Malformed handle.");
+      if (codeOf(err) === "not_your_namespace") return fail(c, 400, "not_your_namespace", "Not your namespace.");
       throw err;
     }
     return c.json(
@@ -267,6 +321,68 @@ export function registerOwnerRoutes(app: Hono, opts: OwnerOptions): void {
       if (code === "already_granted") return fail(c, 409, code, "These agents are already connected.");
       throw err;
     }
+  });
+
+  // ---- connections between people ----
+
+  app.post("/v0/owner/connections/invites", async (c) => {
+    const user = await owner(c);
+    if (user instanceof Response) return user;
+    if (!(await store.getProfile(user.id)).username) {
+      return fail(c, 409, "username_required", "Pick your username first.");
+    }
+    const b = await body<{ note?: unknown }>(c);
+    const inv = await store.createConnectionInvite(user.id, typeof b.note === "string" ? b.note.slice(0, 500) : undefined);
+    return c.json(
+      { token: inv.token, url: `${publicBase}/c/${inv.token}`, expires_at: new Date(inv.expiresAt).toISOString() },
+      201,
+    );
+  });
+
+  app.post("/v0/owner/connections/accept", async (c) => {
+    const user = await owner(c);
+    if (user instanceof Response) return user;
+    const b = await body<{ invite?: unknown }>(c);
+    const token = /lci_[0-9a-f]+/.exec(typeof b.invite === "string" ? b.invite : "")?.[0];
+    if (!token) return fail(c, 400, "invalid_invite", "Paste the connection link (…/c/lci_…).");
+    try {
+      const conn = await store.acceptConnectionInvite(token, user.id);
+      const view = (await store.listConnections(user.id)).find((x) => x.id === conn.id);
+      return c.json(view);
+    } catch (err) {
+      const code = codeOf(err);
+      if (code === "unknown_invite") return fail(c, 404, code, "That link doesn't exist.");
+      if (code === "invite_spent") return fail(c, 410, code, "That link was already used.");
+      if (code === "invite_expired") return fail(c, 410, code, "That link expired. Ask for a new one.");
+      if (code === "self_redeem") return fail(c, 400, code, "That's your own link.");
+      if (code === "already_connected") return fail(c, 409, code, "You're already connected.");
+      throw err;
+    }
+  });
+
+  app.put("/v0/owner/connections/:id/shares/:handle", async (c) => {
+    const user = await owner(c);
+    if (user instanceof Response) return user;
+    const agent = await ownedAgent(c, user);
+    if (agent instanceof Response) return agent;
+    const b = await body<{ shared?: unknown }>(c);
+    if (typeof b.shared !== "boolean") return fail(c, 400, "invalid_body", 'Send {"shared": true|false}.');
+    try {
+      await store.setShare(user.id, c.req.param("id"), agent.actorId, b.shared);
+    } catch (err) {
+      if (codeOf(err) === "not_found") return fail(c, 404, "not_found", "No such connection.");
+      throw err;
+    }
+    return c.json((await store.listConnections(user.id)).find((x) => x.id === c.req.param("id")));
+  });
+
+  app.delete("/v0/owner/connections/:id", async (c) => {
+    const user = await owner(c);
+    if (user instanceof Response) return user;
+    if (!(await store.deleteConnection(user.id, c.req.param("id")))) {
+      return fail(c, 404, "not_found", "No such connection.");
+    }
+    return c.json({ deleted: true });
   });
 
   app.post("/v0/owner/agents/:handle/grants/:grant_id/repin", async (c) => {

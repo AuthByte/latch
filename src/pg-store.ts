@@ -2,11 +2,15 @@ import { sha256hex } from "./crypto.js";
 import {
   actorId as newActorId,
   bearerToken,
+  connectionId as newConnectionId,
+  connectionInviteToken,
   grantId,
   HANDLE_RE,
   inviteToken,
   recoverySecret,
   resetToken,
+  splitHandle,
+  USERNAME_RE,
 } from "./ids.js";
 import {
   AGE_KEY_RE,
@@ -15,6 +19,9 @@ import {
   storeError,
   type Actor,
   type AgentPublic,
+  type Connection,
+  type ConnectionInvite,
+  type ConnectionView,
   type Grant,
   type Invite,
   type OpenResult,
@@ -111,6 +118,25 @@ function toGrant(r: Row): Grant {
     pinB: pin(r.pin_b_age, r.pin_b_signing),
     createdAt: ms(r.created_at)!,
     revoked: r.revoked,
+    ...(r.connection_id ? { connectionId: r.connection_id } : {}),
+  };
+}
+
+function toProfile(r: Row | undefined): Profile {
+  return {
+    username: r?.username ?? null,
+    display_name: r?.display_name ?? null,
+    onboarded_at: r?.onboarded_at ? ts(ms(r.onboarded_at)!) : null,
+  };
+}
+
+function toConnectionInvite(r: Row): ConnectionInvite {
+  return {
+    token: r.token,
+    fromOwner: r.from_owner,
+    note: r.note ?? undefined,
+    expiresAt: ms(r.expires_at)!,
+    accepted: r.accepted,
   };
 }
 
@@ -167,9 +193,7 @@ export class PgStore implements Store {
     const now = this.now();
     try {
       return await this.db.tx(async (db) => {
-        if (await this.one(db, `select 1 from latch.actors where handle = $1`, [handle])) {
-          throw storeError("handle_taken");
-        }
+        if (await this.nameInUse(db, handle)) throw storeError("handle_taken");
         const r = await this.one(
           db,
           `select owner_id, code_hash from latch.reservations where handle = $1 and expires_at > $2::timestamptz for update`,
@@ -179,6 +203,8 @@ export class PgStore implements Store {
           throw storeError("bad_setup_code");
         }
         if (r && opts.setupCodeHash === undefined) throw storeError("handle_reserved");
+        // "nebula.capy" lives in nebula's namespace: only nebula's setup codes create it.
+        if (!r && splitHandle(handle).owner) throw storeError("handle_reserved");
         const row = await this.one(
           db,
           `insert into latch.actors (actor_id, handle, token_hash, recovery_hash, owner_id, created_at)
@@ -186,11 +212,66 @@ export class PgStore implements Store {
           [newActorId(now), handle, sha256hex(token), sha256hex(recovery_secret), r?.owner_id ?? null, ts(now)],
         );
         await db.query(`delete from latch.reservations where handle = $1`, [handle]);
+        if (r?.owner_id) await this.linkSiblings(db, r.owner_id);
         return { actor: toActor(row!), token, recovery_secret };
       });
     } catch (err) {
       if (isUnique(err)) throw storeError("handle_taken");
       throw err;
+    }
+  }
+
+  /** Is this exact string an actor handle, an alias, or someone's username? */
+  private async nameInUse(db: Db, name: string): Promise<boolean> {
+    return Boolean(
+      await this.one(
+        db,
+        `select 1 from latch.actors where handle = $1
+         union all select 1 from latch.aliases where handle = $1
+         union all select 1 from latch.profiles where username = $1
+         limit 1`,
+        [name],
+      ),
+    );
+  }
+
+  private async insertGrant(db: Db, x: Actor, y: Actor, connectionId?: string): Promise<Grant> {
+    const [a, b] = x.actorId < y.actorId ? [x, y] : [y, x];
+    const row = await this.one(
+      db,
+      `insert into latch.grants (id, a, b, pin_a_age, pin_a_signing, pin_b_age, pin_b_signing, created_at, connection_id)
+       values ($1, $2, $3, $4, $5, $6, $7, $8::timestamptz, $9) returning *`,
+      [
+        grantId(this.now()),
+        a.actorId,
+        b.actorId,
+        a.agePublicKey ?? null,
+        a.signingPublicKey ?? null,
+        b.agePublicKey ?? null,
+        b.signingPublicKey ?? null,
+        ts(this.now()),
+        connectionId ?? null,
+      ],
+    );
+    return toGrant(row!);
+  }
+
+  private async liveGrant(db: Db, x: string, y: string): Promise<boolean> {
+    const [a, b] = x < y ? [x, y] : [y, x];
+    return Boolean(await this.one(db, `select 1 from latch.grants where a = $1 and b = $2 and not revoked`, [a, b]));
+  }
+
+  /** An owner's own agents can always reach each other. Pins fill on first publish. */
+  private async linkSiblings(db: Db, ownerId: string): Promise<void> {
+    const mine = (
+      await db.query(`select * from latch.actors where owner_id = $1 order by created_at`, [ownerId])
+    ).map(toActor);
+    for (let i = 0; i < mine.length; i++) {
+      for (let j = i + 1; j < mine.length; j++) {
+        if (!(await this.liveGrant(db, mine[i].actorId, mine[j].actorId))) {
+          await this.insertGrant(db, mine[i], mine[j]);
+        }
+      }
     }
   }
 
@@ -212,7 +293,14 @@ export class PgStore implements Store {
   }
 
   async byHandle(handle: string): Promise<Actor | undefined> {
-    const r = await this.one(this.db, `select * from latch.actors where handle = $1`, [handle]);
+    const r = await this.one(
+      this.db,
+      `select * from latch.actors where handle = $1
+       union all
+       select a.* from latch.aliases x join latch.actors a on a.actor_id = x.actor_id where x.handle = $1
+       limit 1`,
+      [handle],
+    );
     return r && toActor(r);
   }
 
@@ -302,22 +390,7 @@ export class PgStore implements Store {
           throw storeError("already_granted");
         }
         await db.query(`update latch.invites set redeemed = true where token = $1`, [token]);
-        const row = await this.one(
-          db,
-          `insert into latch.grants (id, a, b, pin_a_age, pin_a_signing, pin_b_age, pin_b_signing, created_at)
-           values ($1, $2, $3, $4, $5, $6, $7, $8::timestamptz) returning *`,
-          [
-            grantId(this.now()),
-            a.actorId,
-            b.actorId,
-            a.agePublicKey ?? null,
-            a.signingPublicKey ?? null,
-            b.agePublicKey ?? null,
-            b.signingPublicKey ?? null,
-            ts(this.now()),
-          ],
-        );
-        return toGrant(row!);
+        return this.insertGrant(db, a, b);
       });
     } catch (err) {
       if (isUnique(err)) throw storeError("already_granted");
@@ -575,7 +648,13 @@ export class PgStore implements Store {
 
   async deleteHandle(handle: string): Promise<boolean> {
     return this.db.tx(async (db) => {
-      const r = await this.one(db, `select actor_id from latch.actors where handle = $1`, [handle]);
+      const r = await this.one(
+        db,
+        `select actor_id from latch.actors where handle = $1
+         union all select actor_id from latch.aliases where handle = $1
+         limit 1`,
+        [handle],
+      );
       if (!r) return false;
       await db.query(
         `update latch.messages set status = 'expired', expired_at = $2::timestamptz, payload = null,
@@ -607,9 +686,7 @@ export class PgStore implements Store {
     handle: string,
   ): Promise<{ available: boolean; reason?: "invalid" | "taken" | "reserved" }> {
     if (!HANDLE_RE.test(handle)) return { available: false, reason: "invalid" };
-    if (await this.one(this.db, `select 1 from latch.actors where handle = $1`, [handle])) {
-      return { available: false, reason: "taken" };
-    }
+    if (await this.nameInUse(this.db, handle)) return { available: false, reason: "taken" };
     if (
       await this.one(this.db, `select 1 from latch.reservations where handle = $1 and expires_at > $2::timestamptz`, [
         handle,
@@ -624,9 +701,12 @@ export class PgStore implements Store {
   async reserveHandle(r: Reservation): Promise<void> {
     if (!HANDLE_RE.test(r.handle)) throw storeError("invalid_handle");
     await this.db.tx(async (db) => {
-      if (await this.one(db, `select 1 from latch.actors where handle = $1`, [r.handle])) {
-        throw storeError("handle_taken");
+      const ns = splitHandle(r.handle).owner;
+      if (ns !== undefined) {
+        const p = await this.one(db, `select username from latch.profiles where user_id = $1`, [r.ownerId]);
+        if (p?.username !== ns) throw storeError("not_your_namespace");
       }
+      if (await this.nameInUse(db, r.handle)) throw storeError("handle_taken");
       const row = await this.one(
         db,
         `insert into latch.reservations (handle, owner_id, code_hash, expires_at)
@@ -668,11 +748,7 @@ export class PgStore implements Store {
   }
 
   async getProfile(ownerId: string): Promise<Profile> {
-    const r = await this.one(this.db, `select * from latch.profiles where user_id = $1`, [ownerId]);
-    return {
-      display_name: r?.display_name ?? null,
-      onboarded_at: r?.onboarded_at ? ts(ms(r.onboarded_at)!) : null,
-    };
+    return toProfile(await this.one(this.db, `select * from latch.profiles where user_id = $1`, [ownerId]));
   }
 
   async updateProfile(ownerId: string, patch: { display_name?: string; onboarded?: boolean }): Promise<Profile> {
@@ -685,9 +761,225 @@ export class PgStore implements Store {
        returning *`,
       [ownerId, patch.display_name ?? null, patch.onboarded ? ts(this.now()) : null],
     );
-    return {
-      display_name: r?.display_name ?? null,
-      onboarded_at: r?.onboarded_at ? ts(ms(r.onboarded_at)!) : null,
+    return toProfile(r);
+  }
+
+  private async usernameAvailabilityIn(
+    db: Db,
+    name: string,
+    ownerId: string,
+  ): Promise<{ available: boolean; reason?: "invalid" | "taken" }> {
+    if (!USERNAME_RE.test(name)) return { available: false, reason: "invalid" };
+    const holder = await this.one(db, `select user_id from latch.profiles where username = $1`, [name]);
+    if (holder) return holder.user_id === ownerId ? { available: true } : { available: false, reason: "taken" };
+    // A bare agent of yours with this name is fine: it moves to name.main.
+    const actor = await this.one(
+      db,
+      `select owner_id from latch.actors where handle = $1
+       union all
+       select a.owner_id from latch.aliases x join latch.actors a on a.actor_id = x.actor_id where x.handle = $1
+       limit 1`,
+      [name],
+    );
+    if (actor && actor.owner_id !== ownerId) return { available: false, reason: "taken" };
+    const r = await this.one(
+      db,
+      `select owner_id from latch.reservations where handle = $1 and expires_at > $2::timestamptz`,
+      [name, ts(this.now())],
+    );
+    if (r && r.owner_id !== ownerId) return { available: false, reason: "taken" };
+    return { available: true };
+  }
+
+  usernameAvailability(name: string, ownerId: string) {
+    return this.usernameAvailabilityIn(this.db, name, ownerId);
+  }
+
+  async setUsername(
+    ownerId: string,
+    name: string,
+  ): Promise<{ username: string; renamed: Array<{ from: string; to: string }> }> {
+    try {
+      return await this.db.tx(async (db) => {
+        const cur = await this.one(db, `select username from latch.profiles where user_id = $1 for update`, [ownerId]);
+        if (cur?.username === name) return { username: name, renamed: [] };
+        if (cur?.username) throw storeError("username_set");
+        const avail = await this.usernameAvailabilityIn(db, name, ownerId);
+        if (!avail.available) throw storeError(avail.reason === "invalid" ? "invalid_username" : "username_taken");
+        await db.query(
+          `insert into latch.profiles (user_id, username) values ($1, $2)
+           on conflict (user_id) do update set username = $2`,
+          [ownerId, name],
+        );
+        await db.query(`delete from latch.reservations where handle = $1`, [name]);
+        const renamed: Array<{ from: string; to: string }> = [];
+        const bare = await db.query(
+          `select actor_id, handle from latch.actors where owner_id = $1 and position('.' in handle) = 0 order by created_at`,
+          [ownerId],
+        );
+        for (const a of bare) {
+          const from = a.handle as string;
+          const base = `${name}.${from === name ? "main" : from}`;
+          let to = base;
+          for (let n = 2; ; n++) {
+            const reserved = await this.one(
+              db,
+              `select 1 from latch.reservations where handle = $1 and expires_at > $2::timestamptz`,
+              [to, ts(this.now())],
+            );
+            if (!reserved && !(await this.nameInUse(db, to))) break;
+            to = `${base}-${n}`;
+          }
+          await db.query(`update latch.actors set handle = $2 where actor_id = $1`, [a.actor_id, to]);
+          // The old handle keeps resolving (peers' scripts, recovery). For "nebula"
+          // itself, @nebula now names the person and reaches their main agent.
+          await db.query(
+            `insert into latch.aliases (handle, actor_id) values ($1, $2)
+             on conflict (handle) do update set actor_id = excluded.actor_id`,
+            [from, a.actor_id],
+          );
+          renamed.push({ from, to });
+        }
+        await this.linkSiblings(db, ownerId);
+        return { username: name, renamed };
+      });
+    } catch (err) {
+      if (isUnique(err)) throw storeError("username_taken");
+      throw err;
+    }
+  }
+
+  async createConnectionInvite(ownerId: string, note?: string): Promise<ConnectionInvite> {
+    const inv: ConnectionInvite = {
+      token: connectionInviteToken(),
+      fromOwner: ownerId,
+      note,
+      expiresAt: this.now() + INVITE_TTL_MS,
+      accepted: false,
     };
+    await this.db.query(
+      `insert into latch.connection_invites (token, from_owner, note, expires_at) values ($1, $2, $3, $4::timestamptz)`,
+      [inv.token, ownerId, note ?? null, ts(inv.expiresAt)],
+    );
+    return inv;
+  }
+
+  async getConnectionInvite(token: string): Promise<ConnectionInvite | undefined> {
+    const r = await this.one(this.db, `select * from latch.connection_invites where token = $1`, [token]);
+    return r && toConnectionInvite(r);
+  }
+
+  async acceptConnectionInvite(token: string, ownerId: string): Promise<Connection> {
+    try {
+      return await this.db.tx(async (db) => {
+        const r = await this.one(db, `select * from latch.connection_invites where token = $1 for update`, [token]);
+        if (!r) throw storeError("unknown_invite");
+        const inv = toConnectionInvite(r);
+        if (inv.accepted) throw storeError("invite_spent");
+        if (inv.expiresAt <= this.now()) throw storeError("invite_expired");
+        if (inv.fromOwner === ownerId) throw storeError("self_redeem");
+        const [ownerA, ownerB] = inv.fromOwner < ownerId ? [inv.fromOwner, ownerId] : [ownerId, inv.fromOwner];
+        if (await this.one(db, `select 1 from latch.connections where owner_a = $1 and owner_b = $2`, [ownerA, ownerB])) {
+          throw storeError("already_connected");
+        }
+        await db.query(`update latch.connection_invites set accepted = true where token = $1`, [token]);
+        const c: Connection = { id: newConnectionId(this.now()), ownerA, ownerB, createdAt: this.now() };
+        await db.query(
+          `insert into latch.connections (id, owner_a, owner_b, created_at) values ($1, $2, $3, $4::timestamptz)`,
+          [c.id, ownerA, ownerB, ts(c.createdAt)],
+        );
+        return c;
+      });
+    } catch (err) {
+      if (isUnique(err)) throw storeError("already_connected");
+      throw err;
+    }
+  }
+
+  async listConnections(ownerId: string): Promise<ConnectionView[]> {
+    const conns = await this.db.query(
+      `select c.*, p.username as peer_username
+         from latch.connections c
+         left join latch.profiles p
+           on p.user_id = case when c.owner_a = $1 then c.owner_b else c.owner_a end
+        where c.owner_a = $1 or c.owner_b = $1
+        order by c.created_at, c.id`,
+      [ownerId],
+    );
+    if (conns.length === 0) return [];
+    const shared = await this.db.query(
+      `select s.connection_id, a.handle, a.owner_id
+         from latch.shares s join latch.actors a on a.actor_id = s.actor_id
+        where s.connection_id in (select jsonb_array_elements_text($1::text::jsonb))
+        order by a.handle`,
+      [JSON.stringify(conns.map((c) => c.id))],
+    );
+    return conns.map((c) => {
+      const peer = c.owner_a === ownerId ? c.owner_b : c.owner_a;
+      const of = (owner: string) =>
+        shared.filter((s) => s.connection_id === c.id && s.owner_id === owner).map((s) => s.handle as string);
+      return {
+        id: c.id,
+        peer: { user_id: peer, username: c.peer_username ?? null },
+        mine: of(ownerId),
+        theirs: of(peer),
+        created_at: ts(ms(c.created_at)!),
+      };
+    });
+  }
+
+  async setShare(ownerId: string, connectionId: string, actorId: string, shared: boolean): Promise<void> {
+    await this.db.tx(async (db) => {
+      const c = await this.one(
+        db,
+        `select * from latch.connections where id = $1 and (owner_a = $2 or owner_b = $2)`,
+        [connectionId, ownerId],
+      );
+      const row = await this.one(db, `select * from latch.actors where actor_id = $1 and owner_id = $2`, [
+        actorId,
+        ownerId,
+      ]);
+      if (!c || !row) throw storeError("not_found");
+      if (!shared) {
+        await db.query(`delete from latch.shares where connection_id = $1 and actor_id = $2`, [connectionId, actorId]);
+        await db.query(
+          `update latch.grants set revoked = true
+            where connection_id = $1 and not revoked and (a = $2 or b = $2)`,
+          [connectionId, actorId],
+        );
+        return;
+      }
+      await db.query(
+        `insert into latch.shares (connection_id, actor_id) values ($1, $2) on conflict do nothing`,
+        [connectionId, actorId],
+      );
+      const peer = c.owner_a === ownerId ? c.owner_b : c.owner_a;
+      const theirs = (
+        await db.query(
+          `select a.* from latch.shares s join latch.actors a on a.actor_id = s.actor_id
+            where s.connection_id = $1 and a.owner_id = $2`,
+          [connectionId, peer],
+        )
+      ).map(toActor);
+      const mine = toActor(row);
+      for (const t of theirs) {
+        if (!(await this.liveGrant(db, mine.actorId, t.actorId))) await this.insertGrant(db, mine, t, connectionId);
+      }
+    });
+  }
+
+  async deleteConnection(ownerId: string, connectionId: string): Promise<boolean> {
+    return this.db.tx(async (db) => {
+      const c = await this.one(
+        db,
+        `select 1 from latch.connections where id = $1 and (owner_a = $2 or owner_b = $2)`,
+        [connectionId, ownerId],
+      );
+      if (!c) return false;
+      await db.query(`update latch.grants set revoked = true where connection_id = $1 and not revoked`, [connectionId]);
+      // Shares cascade; revoked grants keep the id only as history (set null).
+      await db.query(`delete from latch.connections where id = $1`, [connectionId]);
+      return true;
+    });
   }
 }

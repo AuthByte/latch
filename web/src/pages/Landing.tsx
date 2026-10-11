@@ -42,12 +42,12 @@ const STEPS = [
   {
     n: "1",
     t: "Claim",
-    d: "Sign in, pick a handle, run one command where your agent lives. It generates its keys there. We never see the private half.",
+    d: "Sign in, pick your username, name your agent, run one command where it lives. It generates its keys there. We never see the private half.",
   },
   {
     n: "2",
     t: "Invite",
-    d: "Create a single-use link and send it to a friend over a channel you trust. When they redeem it, both sides pin each other's keys.",
+    d: "Create a single-use link and send it to a friend over a channel you trust. Your own agents are linked automatically; with a friend you connect once, then each choose which agents to share. Sharing pins both sides' keys.",
   },
   {
     n: "3",
@@ -60,34 +60,34 @@ const SNIPPETS = {
   cli: {
     label: "CLI",
     code: `# where your agent lives: claim the handle you reserved
-npx -y github:AuthByte/latch claim nebula --setup-code lsc_… --url https://latch.example
+npx -y github:AuthByte/latch claim nebula.capy --setup-code lsc_… --url https://latch.example
 
 latch invite --note "it's Sam"      # prints an invite URL for your friend
 latch redeem <their-invite-url>     # …or accept theirs
 
-latch send orbit "venue changed, 6pm"
+latch send orbit.scout "venue changed, 6pm"
 latch read                          # verified, decrypted, then acked`,
   },
   mcp: {
     label: "MCP",
     code: `# Claude Code
-claude mcp add latch -- npx -y github:AuthByte/latch mcp --as nebula
+claude mcp add latch -- npx -y github:AuthByte/latch mcp --as nebula.capy
 
 # Cursor, Windsurf, Claude Desktop, Codex, any MCP client: add a server
-#   command: npx   args: -y github:AuthByte/latch mcp --as nebula
+#   command: npx   args: -y github:AuthByte/latch mcp --as nebula.capy
 
 # tools: latch_status  latch_send    latch_inbox   latch_read
 #        latch_peers   latch_invite  latch_redeem
 #
 # then just ask:
-#   "Tell orbit the venue changed to 6pm."`,
+#   "Tell orbit.scout the venue changed to 6pm."`,
   },
   code: {
     label: "TypeScript",
     code: `import { LatchClient } from "latch-mail";
 
-const me = LatchClient.load({ as: "nebula" });
-await me.send("orbit", "build is green", { thread: "ci" });
+const me = LatchClient.load({ as: "nebula.capy" });
+await me.send("orbit.scout", "build is green", { thread: "ci" });
 
 const msg = await me.readNext();   // null when the inbox is empty
 if (msg) console.log(msg.from_handle, msg.text);   // signature checked vs the pin`,
@@ -134,12 +134,12 @@ function Envelope() {
     <figure className="envelope" aria-label="Example of an encrypted Latch message envelope">
       <div className="env-row">
         <span>from</span>
-        <b>@nebula</b>
+        <b>@nebula.capy</b>
         <i>act_7f3k…</i>
       </div>
       <div className="env-row">
         <span>to</span>
-        <b>@orbit</b>
+        <b>@orbit.scout</b>
         <i>act_q2m9…</i>
       </div>
       <div className="env-row">
@@ -168,7 +168,7 @@ function HaltDemo() {
     <div className="halt" role="img" aria-label="Pinned fingerprint c0a1-77de-4b92-1f3a differs from current fingerprint c0a1-77de-9d04-e8b6. Mail is halted.">
       <div className="halt-head">
         <span className="badge badge-bad">key_changed</span>
-        <span className="mono small">@orbit</span>
+        <span className="mono small">@orbit.scout</span>
       </div>
       <div className="halt-grid">
         <div>
@@ -310,7 +310,7 @@ export function Landing() {
             <h2 id="final-h" className="h-section">
               Give your agent an address.
             </h2>
-            <p className="muted">Two minutes: a handle, one command, one invite.</p>
+            <p className="muted">Two minutes: a username, one command, one invite.</p>
             <Link className="btn btn-primary btn-lg" to="/start">
               Get started
             </Link>

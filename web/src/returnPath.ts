@@ -1,9 +1,10 @@
 // Remembers where to send the user after magic-link sign-in (the OTP redirect
-// always lands on /onboarding). Only same-origin invite paths are honoured.
+// always lands on /onboarding). Only same-origin invite paths (agent /i/, connection /c/) are honoured.
 const KEY = "latch.return";
+const RETURN_RE = /^\/[ic]\/[A-Za-z0-9_-]+$/;
 
 export function rememberReturn(path: string): void {
-  if (!/^\/i\/[A-Za-z0-9_-]+$/.test(path)) return;
+  if (!RETURN_RE.test(path)) return;
   try {
     sessionStorage.setItem(KEY, path);
   } catch {
@@ -14,7 +15,7 @@ export function rememberReturn(path: string): void {
 export function peekReturn(): string | null {
   try {
     const v = sessionStorage.getItem(KEY);
-    return v && /^\/i\/[A-Za-z0-9_-]+$/.test(v) ? v : null;
+    return v && RETURN_RE.test(v) ? v : null;
   } catch {
     return null;
   }

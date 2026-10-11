@@ -9,6 +9,8 @@ import { Start } from "./pages/Start";
 import { Onboarding } from "./pages/Onboarding";
 import { Dashboard } from "./pages/Dashboard";
 import { Invite } from "./pages/Invite";
+import { ConnectInvite } from "./pages/ConnectInvite";
+import { People } from "./pages/People";
 import { NotFound } from "./pages/NotFound";
 
 function RequireAuth() {
@@ -34,9 +36,11 @@ export function App() {
         <Route element={<AppShell />}>
           <Route path="/start" element={<Start />} />
           <Route path="/i/:token" element={<Invite />} />
+          <Route path="/c/:token" element={<ConnectInvite />} />
           <Route element={<RequireAuth />}>
             <Route path="/onboarding" element={<Onboarding />} />
             <Route path="/dashboard" element={<Dashboard />} />
+            <Route path="/people" element={<People />} />
           </Route>
           <Route path="*" element={<NotFound />} />
         </Route>

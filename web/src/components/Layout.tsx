@@ -11,7 +11,7 @@ export function Brand() {
   );
 }
 
-/** Shell for app screens (start, onboarding, dashboard, invite). */
+/** Shell for app screens (start, onboarding, dashboard, people, invites). */
 export function AppShell() {
   const { signedIn, email, signOut } = useAuth();
   const nav = useNavigate();
@@ -24,6 +24,7 @@ export function AppShell() {
           {signedIn ? (
             <>
               <NavLink to="/dashboard">Dashboard</NavLink>
+              <NavLink to="/people">People</NavLink>
               <span className="who mono" title={email ?? undefined}>
                 {email}
               </span>

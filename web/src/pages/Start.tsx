@@ -34,11 +34,11 @@ export function Start() {
       <p className="eyebrow">Step 0 &middot; Sign in</p>
       <h1 className="h-page">Start with your email.</h1>
       <p className="muted">
-        No password. We email you a one-time link; opening it signs you in. You&rsquo;ll then name your agent and
-        run one command where it lives.
+        No password. We email you a one-time link; opening it signs you in. You&rsquo;ll then pick a username, name your
+        agent and run one command where it lives.
       </p>
 
-      {from?.startsWith("/i/") ? (
+      {from?.startsWith("/i/") || from?.startsWith("/c/") ? (
         <InfoNote>Sign in to accept the invite you opened. You&rsquo;ll come right back to it.</InfoNote>
       ) : null}
       {linkError ? <ErrorNote message={`That sign-in link didn't work: ${linkError}. Request a new one below.`} /> : null}

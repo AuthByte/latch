@@ -359,9 +359,9 @@ export class LatchClient {
   async grantFor(peer: string, fresh = true): Promise<GrantView> {
     const list = await this.grants(fresh);
     const p = peer.replace(/^@/, "").toLowerCase();
-    const g = list.find(
-      (x) => x.peer.handle === p || x.peer.actor_id === peer || x.grant_id === peer,
-    );
+    const g =
+      list.find((x) => x.peer.handle === p || x.peer.actor_id === peer || x.grant_id === peer) ??
+      shortName(list, p, this.creds.handle);
     if (!g) {
       throw new LatchError(
         "no_grant",
@@ -526,7 +526,13 @@ export class LatchClient {
   async readNext(opts?: { ack?: boolean; from?: string }): Promise<(OpenedMessage & { remaining: number }) | null> {
     const box = await this.inbox();
     const from = opts?.from?.replace(/^@/, "").toLowerCase();
-    const next = box.messages.find((m) => !from || m.from_handle === from || m.from === opts?.from);
+    const next = box.messages.find(
+      (m) =>
+        !from ||
+        m.from_handle === from ||
+        m.from === opts?.from ||
+        (!from.includes(".") && Boolean(m.from_handle?.endsWith(`.${from}`))),
+    );
     if (!next) return null;
     const msg = await this.open(next.id);
     if (opts?.ack !== false) await this.ack(next.id);
@@ -583,6 +589,19 @@ export class LatchClient {
       problems,
     };
   }
+}
+
+/**
+ * "capy" for a peer called "nebula.capy": first a sibling in my own namespace,
+ * then any peer whose agent part is unambiguous.
+ */
+function shortName(list: GrantView[], name: string, me: string): GrantView | undefined {
+  if (name.includes(".")) return undefined;
+  const ns = me.includes(".") ? me.slice(0, me.indexOf(".")) : undefined;
+  const sibling = ns ? list.find((x) => x.peer.handle === `${ns}.${name}`) : undefined;
+  if (sibling) return sibling;
+  const hits = list.filter((x) => x.peer.handle.endsWith(`.${name}`));
+  return hits.length === 1 ? hits[0] : undefined;
 }
 
 function guardOverwrite(path: string, handle: string): void {

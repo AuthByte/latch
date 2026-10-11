@@ -1,14 +1,28 @@
 export const HANDLE_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
-/** Returns a problem description, or null if the handle is syntactically valid. */
-export function handleProblem(h: string): string | null {
-  if (h.length < 3) return "At least 3 characters.";
+/** Shared rules for usernames, agent names and bare handles. Returns a problem or null. */
+function slugProblem(h: string, min: number, what: string): string | null {
+  if (h.length < min) return min === 1 ? "Enter a name." : `At least ${min} characters.`;
   if (h.length > 32) return "At most 32 characters.";
   if (/[A-Z]/.test(h)) return "Lowercase only.";
   if (!/^[a-z0-9-]+$/.test(h)) return "Use only a-z, 0-9 and hyphens.";
   if (h.startsWith("-") || h.endsWith("-")) return "Cannot start or end with a hyphen.";
   if (h.includes("--")) return "No double hyphens.";
-  return HANDLE_RE.test(h) ? null : "Invalid handle.";
+  return HANDLE_RE.test(h) ? null : `Invalid ${what}.`;
+}
+
+/** Returns a problem description, or null if the handle is syntactically valid. */
+export const handleProblem = (h: string) => slugProblem(h, 3, "handle");
+/** Username rules (3–32). */
+export const usernameProblem = (u: string) => slugProblem(u, 3, "username");
+/** The agent part of `username.name` (1–32). */
+export const agentNameProblem = (n: string) => slugProblem(n, 1, "name");
+
+/** Where a username's older bare-handle agents will land: `nebula` → `nebula.main`, `capy` → `nebula.capy`. */
+export function renamePreview(username: string, handles: string[]): { from: string; to: string }[] {
+  return handles
+    .filter((h) => !h.includes("."))
+    .map((h) => ({ from: h, to: h === username ? `${username}.main` : `${username}.${h}` }));
 }
 
 export function fmtTime(iso: string): string {

@@ -32,14 +32,25 @@ export type Agent = {
 };
 
 export type Pending = { handle: string; expires_at: string; command: string };
-export type Profile = { display_name: string | null; onboarded_at: string | null };
+export type Profile = { username: string | null; display_name: string | null; onboarded_at: string | null };
+
+/** A link between two people. `mine`/`theirs` are the agent handles each side shares. */
+export type Connection = {
+  id: string;
+  peer: { user_id: string; username: string | null };
+  mine: string[];
+  theirs: string[];
+  created_at: string;
+};
 
 export type Me = {
   user_id: string;
   email: string;
+  username: string | null;
   profile: Profile;
   agents: Agent[];
   pending: Pending[];
+  connections: Connection[];
 };
 
 export type SetupCode = {
@@ -50,6 +61,7 @@ export type SetupCode = {
   mcp_command: string;
 };
 
+export type UsernameResult = { username: string; renamed: { from: string; to: string }[]; profile: Profile };
 export type InviteMint = { token: string; url: string; expires_at: string };
 export type RedeemResult = { grant_id: string; peer: { handle: string; actor_id: string } };
 export type ResetResult = { reset_token: string; expires_at: string; command: string };
@@ -58,9 +70,21 @@ export type Availability = {
   available: boolean;
   reason?: "invalid" | "taken" | "reserved";
 };
+export type UsernameAvailability = {
+  username: string;
+  available: boolean;
+  reason?: "invalid" | "taken";
+};
 export type InvitePreview = {
   valid: boolean;
   from_handle?: string;
+  note?: string;
+  expires_at?: string;
+};
+export type ConnectionPreview = {
+  valid: boolean;
+  from_username?: string;
+  from_name?: string | null;
   note?: string;
   expires_at?: string;
 };
@@ -145,13 +169,21 @@ export const checkHandle = (handle: string, signal?: AbortSignal) =>
   request<Availability>("GET", `/v0/handles/${enc(handle)}/availability`, { auth: false, signal });
 export const previewInvite = (token: string) =>
   request<InvitePreview>("GET", `/v0/invites/${enc(token)}`, { auth: false });
+export const previewConnection = (token: string) =>
+  request<ConnectionPreview>("GET", `/v0/connection-invites/${enc(token)}`, { auth: false });
 
 // ---- owner ----
 export const getMe = (signal?: AbortSignal) => request<Me>("GET", "/v0/owner/me", { signal });
 export const patchMe = (body: { display_name?: string; onboarded?: true }) =>
   request<{ profile: Profile }>("PATCH", "/v0/owner/me", { body });
-export const createSetupCode = (handle: string) =>
-  request<SetupCode>("POST", "/v0/owner/setup-codes", { body: { handle } });
+/** Authenticated, unlike the handle check. */
+export const checkUsername = (username: string, signal?: AbortSignal) =>
+  request<UsernameAvailability>("GET", `/v0/usernames/${enc(username)}/availability`, { signal });
+export const setUsername = (username: string) =>
+  request<UsernameResult>("PUT", "/v0/owner/username", { body: { username } });
+/** Pass the agent part (`{ name: "capy" }`) to reserve under your username, or a full `{ handle }` to re-issue a code. */
+export const createSetupCode = (target: { name: string } | { handle: string }) =>
+  request<SetupCode>("POST", "/v0/owner/setup-codes", { body: target });
 export const cancelSetupCode = (handle: string) =>
   request<{ cancelled: true }>("DELETE", `/v0/owner/setup-codes/${enc(handle)}`);
 export const createInvite = (handle: string, note?: string) =>
@@ -167,6 +199,16 @@ export const resetAgent = (handle: string) =>
 export const deleteAgent = (handle: string) =>
   request<{ deleted: true }>("DELETE", agentPath(handle));
 
+// ---- connections ----
+export const createConnectionInvite = (note?: string) =>
+  request<InviteMint>("POST", "/v0/owner/connections/invites", { body: note ? { note } : {} });
+export const acceptConnection = (invite: string) =>
+  request<Connection>("POST", "/v0/owner/connections/accept", { body: { invite } });
+export const setShare = (connectionId: string, handle: string, shared: boolean) =>
+  request<Connection>("PUT", `/v0/owner/connections/${enc(connectionId)}/shares/${enc(handle)}`, { body: { shared } });
+export const deleteConnection = (connectionId: string) =>
+  request<{ deleted: true }>("DELETE", `/v0/owner/connections/${enc(connectionId)}`);
+
 // ---- helpers ----
 export function errorMessage(e: unknown): string {
   if (e instanceof ApiError) return e.hint;
@@ -179,5 +221,13 @@ export function inviteTokenFrom(input: string): string | null {
   const s = input.trim();
   if (!s) return null;
   const m = s.match(/\/i\/([A-Za-z0-9_-]+)/) ?? s.match(/\b(lti_[A-Za-z0-9_-]+)/);
+  return m ? m[1] : null;
+}
+
+/** Accepts a full connection URL or a bare lci_ token and returns the token. */
+export function connectionTokenFrom(input: string): string | null {
+  const s = input.trim();
+  if (!s) return null;
+  const m = s.match(/\/c\/([A-Za-z0-9_-]+)/) ?? s.match(/\b(lci_[A-Za-z0-9_-]+)/);
   return m ? m[1] : null;
 }

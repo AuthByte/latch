@@ -86,6 +86,48 @@ create table if not exists latch.profiles (
   created_at timestamptz not null default now()
 );
 
+-- Namespaces: a person's username; their agents are username.name.
+alter table latch.profiles add column if not exists username text unique;
+
+-- Old handles that keep resolving after an agent moved under its owner's username.
+create table if not exists latch.aliases (
+  handle text primary key,
+  actor_id text not null references latch.actors (actor_id) on delete cascade
+);
+create index if not exists aliases_actor_idx on latch.aliases (actor_id);
+
+-- People connections: two owners who agreed their (chosen) agents may talk.
+-- owner_a < owner_b (ordered by the server), so a pair has one row.
+create table if not exists latch.connections (
+  id text primary key,
+  owner_a uuid not null references auth.users (id) on delete cascade,
+  owner_b uuid not null references auth.users (id) on delete cascade,
+  created_at timestamptz not null,
+  unique (owner_a, owner_b)
+);
+create index if not exists connections_b_idx on latch.connections (owner_b);
+
+create table if not exists latch.connection_invites (
+  token text primary key,
+  from_owner uuid not null references auth.users (id) on delete cascade,
+  note text,
+  expires_at timestamptz not null,
+  accepted boolean not null default false
+);
+create index if not exists connection_invites_from_idx on latch.connection_invites (from_owner);
+
+-- Which of my agents I share over a connection. Nothing is shared by default.
+create table if not exists latch.shares (
+  connection_id text not null references latch.connections (id) on delete cascade,
+  actor_id text not null references latch.actors (actor_id) on delete cascade,
+  primary key (connection_id, actor_id)
+);
+create index if not exists shares_actor_idx on latch.shares (actor_id);
+
+alter table latch.grants add column if not exists connection_id text
+  references latch.connections (id) on delete set null;
+create index if not exists grants_connection_idx on latch.grants (connection_id) where connection_id is not null;
+
 alter table latch.actors enable row level security;
 alter table latch.invites enable row level security;
 alter table latch.grants enable row level security;
@@ -93,6 +135,10 @@ alter table latch.messages enable row level security;
 alter table latch.reset_tickets enable row level security;
 alter table latch.reservations enable row level security;
 alter table latch.profiles enable row level security;
+alter table latch.aliases enable row level security;
+alter table latch.connections enable row level security;
+alter table latch.connection_invites enable row level security;
+alter table latch.shares enable row level security;
 
 revoke all on schema latch from anon, authenticated;
 revoke all on all tables in schema latch from anon, authenticated;

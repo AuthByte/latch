@@ -6,9 +6,10 @@ import { useMe } from "../me";
 import { peekReturn } from "../returnPath";
 import { InvitePanel, RedeemPanel } from "../components/Connect";
 import { ReserveAgent } from "../components/Reserve";
+import { UsernamePicker } from "../components/Username";
 import { ErrorNote, InfoNote, PageLoading } from "../components/ui";
 
-const STEPS = ["You", "Agent", "Friend", "Done"] as const;
+const STEPS = ["Username", "You", "Agent", "Friend", "Done"] as const;
 
 function Stepper({ index }: { index: number }) {
   return (
@@ -20,6 +21,19 @@ function Stepper({ index }: { index: number }) {
         </li>
       ))}
     </ol>
+  );
+}
+
+function UsernameStep() {
+  return (
+    <div>
+      <h1 className="h-page">Pick your username.</h1>
+      <p className="muted">
+        Your agents will be <code>@you.agent</code>, like <code>@nebula.capy</code>. It&rsquo;s how friends see you when
+        you connect. Only you can create agents under it.
+      </p>
+      <UsernamePicker />
+    </div>
   );
 }
 
@@ -38,7 +52,7 @@ function NameStep({ initial, onDone }: { initial: string; onDone: () => void }) 
   return (
     <form className="form" onSubmit={onSubmit}>
       <h1 className="h-page">What should we call you?</h1>
-      <p className="muted">Your name is shown to you and on invites you send. Your agent gets its own handle next.</p>
+      <p className="muted">Your name is shown to you and on invites you send. Your agent gets its own name next.</p>
       <label className="field">
         <span className="label">Your name</span>
         <input
@@ -58,7 +72,8 @@ function NameStep({ initial, onDone }: { initial: string; onDone: () => void }) 
   );
 }
 
-function AgentStep({ readyAgent, sawWaiting, onContinue }: {
+function AgentStep({ username, readyAgent, sawWaiting, onContinue }: {
+  username: string;
   readyAgent: Agent | undefined;
   sawWaiting: boolean;
   onContinue: () => void;
@@ -81,8 +96,8 @@ function AgentStep({ readyAgent, sawWaiting, onContinue }: {
     <div>
       <h1 className="h-page">Name your agent.</h1>
       <p className="muted">
-        Pick a handle: it&rsquo;s how friends&rsquo; agents address yours. We reserve it, then you run one command where
-        your agent lives. Keys are generated there; we never see them.
+        Pick a name: together with your username it&rsquo;s how friends&rsquo; agents address yours, like{" "}
+        <code>@{username}.capy</code>. We reserve it, then you run one command where your agent lives. Keys are generated there; we never see them.
       </p>
       <ReserveAgent singleReservation />
     </div>
@@ -99,7 +114,8 @@ function ConnectStep({ agents, onNext }: { agents: Agent[]; onNext: () => void }
     <div>
       <h1 className="h-page">Connect a friend.</h1>
       <p className="muted">
-        Agents can only talk after their humans swap an invite. You can do this now or later from your dashboard.
+        Agents can only talk after their humans swap an invite. Your own agents are linked to each other already. You can
+        do this now, or later: the People page connects you with a friend once and lets you choose which agents to share.
       </p>
       {agents.length > 1 ? (
         <label className="field">
@@ -194,24 +210,29 @@ export function Onboarding() {
   if (me.profile.onboarded_at) return <Navigate to="/dashboard" replace />;
 
   const readyAgents = me.agents.filter((a) => a.keys_ready);
+  const hasUsername = Boolean(me.username);
   const hasName = Boolean(me.profile.display_name);
   let step = 0;
-  if (hasName) step = 1;
-  if (hasName && readyAgents.length > 0 && (!sawWaiting || advanced)) step = 2;
-  if (step === 2 && advanced === "done") step = 3;
+  if (hasUsername) step = 1;
+  if (hasUsername && hasName) step = 2;
+  if (step === 2 && readyAgents.length > 0 && (!sawWaiting || advanced)) step = 3;
+  if (step === 3 && advanced === "done") step = 4;
 
   return (
     <section className="card wizard">
       <Stepper index={step} />
       {step === 0 ? (
-        <NameStep initial={me.profile.display_name ?? ""} onDone={() => undefined} />
+        <UsernameStep />
       ) : step === 1 ? (
+        <NameStep initial={me.profile.display_name ?? ""} onDone={() => undefined} />
+      ) : step === 2 ? (
         <AgentStep
+          username={me.username ?? ""}
           readyAgent={readyAgents[0]}
           sawWaiting={sawWaiting}
           onContinue={() => setAdvanced("connect")}
         />
-      ) : step === 2 ? (
+      ) : step === 3 ? (
         <ConnectStep agents={readyAgents} onNext={() => setAdvanced("done")} />
       ) : (
         <DoneStep />

@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Link } from "react-router-dom";
 import {
   deleteAgent,
   repinGrant,
@@ -37,7 +38,9 @@ function FingerprintCompare({ pinned, current }: { pinned: Fingerprints; current
 }
 
 function PeerRow({ agent, peer }: { agent: Agent; peer: Peer }) {
-  const { refresh } = useMe();
+  const { me, refresh } = useMe();
+  // Same owner namespace: linked automatically, not through an invite.
+  const sibling = Boolean(me?.username && peer.handle.startsWith(`${me.username}.`));
   const [dialog, setDialog] = useState<null | "repin" | "revoke">(null);
   const [verified, setVerified] = useState(false);
   const close = () => {
@@ -67,7 +70,10 @@ function PeerRow({ agent, peer }: { agent: Agent; peer: Peer }) {
             <span className="at">@</span>
             {peer.handle}
           </strong>
-          <span className="muted small"> &middot; connected {fmtDate(peer.created_at)}</span>
+          <span className="muted small">
+            {" "}
+            &middot; {sibling ? "your agent, linked automatically" : `connected ${fmtDate(peer.created_at)}`}
+          </span>
         </div>
         <Badge tone={tone}>{label}</Badge>
       </div>
@@ -273,7 +279,10 @@ export function AgentCard({ agent }: { agent: Agent }) {
       <section aria-label={`Peers of ${agent.handle}`}>
         <h3 className="sub">Peers</h3>
         {agent.peers.length === 0 ? (
-          <p className="muted">No peers yet. Create an invite and send it to a friend, or redeem one you received.</p>
+          <p className="muted">
+            No peers yet. Connect with a friend on the <Link to="/people">People page</Link>, or create an agent invite and
+            send it to them.
+          </p>
         ) : (
           <ul className="peers">
             {agent.peers.map((p) => (

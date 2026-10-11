@@ -39,6 +39,8 @@ export type Grant = {
   pinB: Pin;
   createdAt: number;
   revoked: boolean;
+  /** Set when the grant exists because two owners share agents over a connection. */
+  connectionId?: string;
 };
 
 export type StoredMessage = {
@@ -69,8 +71,37 @@ export type Reservation = {
 };
 
 export type Profile = {
+  /** The owner's namespace: their agents are `${username}.${name}`. Set once. */
+  username: string | null;
   display_name: string | null;
   onboarded_at: string | null;
+};
+
+/** Two owners who agreed to let (some of) their agents talk. */
+export type Connection = {
+  id: string;
+  ownerA: string;
+  ownerB: string;
+  createdAt: number;
+};
+
+export type ConnectionInvite = {
+  token: string;
+  fromOwner: string;
+  note?: string;
+  expiresAt: number;
+  accepted: boolean;
+};
+
+/** A connection from one owner's side: who, and which agents each side shares. */
+export type ConnectionView = {
+  id: string;
+  peer: { user_id: string; username: string | null };
+  /** Handles of my agents I share with them. */
+  mine: string[];
+  /** Handles of their agents they share with me. */
+  theirs: string[];
+  created_at: string;
 };
 
 export type AgentPublic = {
@@ -143,6 +174,20 @@ export interface Store {
   listOwnedActors(ownerId: string): Promise<Actor[]>;
   getProfile(ownerId: string): Promise<Profile>;
   updateProfile(ownerId: string, patch: { display_name?: string; onboarded?: boolean }): Promise<Profile>;
+
+  // Namespaces: one username per owner; agents become `${username}.${name}`.
+  usernameAvailability(name: string, ownerId: string): Promise<{ available: boolean; reason?: "invalid" | "taken" }>;
+  /** Claim a username and move the owner's bare-handle agents under it. */
+  setUsername(ownerId: string, name: string): Promise<{ username: string; renamed: Array<{ from: string; to: string }> }>;
+
+  // Connections between owners. Nothing is shared until each side picks agents.
+  createConnectionInvite(ownerId: string, note?: string): Promise<ConnectionInvite>;
+  getConnectionInvite(token: string): Promise<ConnectionInvite | undefined>;
+  acceptConnectionInvite(token: string, ownerId: string): Promise<Connection>;
+  listConnections(ownerId: string): Promise<ConnectionView[]>;
+  /** Share (or stop sharing) one of my agents with a connection. Grants follow. */
+  setShare(ownerId: string, connectionId: string, actorId: string, shared: boolean): Promise<void>;
+  deleteConnection(ownerId: string, connectionId: string): Promise<boolean>;
 }
 
 export function storeError(code: string): Error {

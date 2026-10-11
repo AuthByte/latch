@@ -32,6 +32,8 @@ export const prefixes = {
   token: "lat_",
   recovery: "lrs_",
   reset: "lrt_",
+  connection: "con_",
+  connectionInvite: "lci_",
 } as const;
 
 export function actorId(now?: number): string {
@@ -58,11 +60,31 @@ export function recoverySecret(): string {
   return prefixes.recovery + randomBytes(24).toString("hex");
 }
 
+export function connectionId(now?: number): string {
+  return prefixes.connection + ulid(now);
+}
+
+export function connectionInviteToken(): string {
+  return prefixes.connectionInvite + randomBytes(18).toString("hex");
+}
+
 export function resetToken(): string {
   return prefixes.reset + randomBytes(24).toString("hex");
 }
 
-export const HANDLE_RE = /^(?=.{3,32}$)[a-z0-9]+(?:-[a-z0-9]+)*$/;
+/** A person's namespace, e.g. "nebula". Shares one namespace with bare handles. */
+export const USERNAME_RE = /^(?=.{3,32}$)[a-z0-9]+(?:-[a-z0-9]+)*$/;
+/** The agent part of "nebula.capy". */
+export const AGENT_NAME_RE = /^(?=.{1,32}$)[a-z0-9]+(?:-[a-z0-9]+)*$/;
+/** A bare legacy handle ("capy") or an owner-namespaced one ("nebula.capy"). */
+export const HANDLE_RE =
+  /^(?:(?=[^.]{3,32}$)[a-z0-9]+(?:-[a-z0-9]+)*|(?=[^.]{3,32}\.)[a-z0-9]+(?:-[a-z0-9]+)*\.(?=[^.]{1,32}$)[a-z0-9]+(?:-[a-z0-9]+)*)$/;
+
+/** "nebula.capy" -> { owner: "nebula", name: "capy" }; bare handles have no owner part. */
+export function splitHandle(handle: string): { owner?: string; name: string } {
+  const i = handle.indexOf(".");
+  return i < 0 ? { name: handle } : { owner: handle.slice(0, i), name: handle.slice(i + 1) };
+}
 export const THREAD_RE = /^thr_[A-Za-z0-9_-]{1,64}$/;
 export const ACTOR_RE = /^act_[0-9A-HJKMNP-TV-Z]{26}$/;
 export const MSG_RE = /^msg_[0-9A-HJKMNP-TV-Z]{26}$/;

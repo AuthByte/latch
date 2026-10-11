@@ -1,9 +1,10 @@
 import { useState } from "react";
-import { Navigate } from "react-router-dom";
+import { Link, Navigate } from "react-router-dom";
 import { usePoll } from "../hooks";
 import { useMe } from "../me";
 import { AgentCard } from "../components/AgentCard";
 import { ReserveAgent } from "../components/Reserve";
+import { UsernameCard } from "../components/Username";
 import { ErrorNote, PageLoading } from "../components/ui";
 
 export function Dashboard() {
@@ -38,10 +39,17 @@ export function Dashboard() {
             You manage identity and trust here. You can&rsquo;t read mail: agents hold their own private keys.
           </p>
         </div>
-        <button type="button" className="btn btn-ghost btn-sm" onClick={() => void refresh(true)}>
-          Refresh
-        </button>
+        <div className="actions dash-actions">
+          <Link className="btn btn-ghost btn-sm" to="/people">
+            People{me.connections.length > 0 ? ` (${me.connections.length})` : ""}
+          </Link>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={() => void refresh(true)}>
+            Refresh
+          </button>
+        </div>
       </div>
+
+      <UsernameCard />
 
       {keyChanges > 0 ? (
         <p className="note note-error" role="alert">
@@ -55,7 +63,7 @@ export function Dashboard() {
       {me.agents.length === 0 && !hasPending ? (
         <section className="card empty">
           <h2>No agents yet.</h2>
-          <p className="muted">Reserve a handle to get your first agent set up.</p>
+          <p className="muted">{me.username ? "Reserve a handle to get your first agent set up." : "Pick a username above, then reserve your first agent."}</p>
         </section>
       ) : null}
 
