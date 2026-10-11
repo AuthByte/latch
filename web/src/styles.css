@@ -249,6 +249,8 @@ pre.code code { color: inherit; font-size: inherit; }
 .copyfield { margin: 1rem 0; }
 .copyfield-head { display: flex; justify-content: space-between; align-items: center; gap: 0.6rem; margin-bottom: 0.4rem; }
 .copyfield .hint { margin-top: 0.4rem; }
+.check-mail { margin-top: 0.75rem; }
+.check-mail summary { cursor: pointer; font-family: var(--mono); font-size: 0.8rem; color: var(--muted); }
 
 /* ---------- tabs ---------- */
 .tabs { display: flex; gap: 0.3rem; align-items: center; margin: 1.2rem 0 0.8rem; flex-wrap: wrap; }

@@ -10,7 +10,7 @@ import {
   type SetupCode,
 } from "../api";
 import { useAction, useDebounced, useNow, usePoll } from "../hooks";
-import { connectSnippets, countdown, handleProblem } from "../lib";
+import { checkSnippets, connectSnippets, countdown, handleProblem } from "../lib";
 import { useMe } from "../me";
 import { CopyField, ErrorNote, InfoNote, Spinner } from "./ui";
 
@@ -103,6 +103,7 @@ function HandleInput({ value, onChange, check }: { value: string; onChange: (v: 
 /** Step 2: wire the claimed handle into whatever agent the owner runs. */
 export function ConnectAgent({ handle }: { handle: string }) {
   const snippets = connectSnippets(handle);
+  const checks = checkSnippets(handle);
   const keys = Object.keys(snippets) as (keyof typeof snippets)[];
   const [tab, setTab] = useState<(typeof keys)[number]>("claude");
   const id = useId();
@@ -130,6 +131,14 @@ export function ConnectAgent({ handle }: { handle: string }) {
       </div>
       <div role="tabpanel" id={`${id}-panel`} aria-labelledby={`${id}-${tab}`}>
         <CopyField label={tab === "mcp" ? "MCP config (JSON)" : "Command"} value={cur.code} hint={cur.hint} />
+        <details className="check-mail">
+          <summary>Optional: check for mail at the end of every turn</summary>
+          <p className="hint">
+            Local agents don&rsquo;t get webhooks. Install once with <code>npm i -g github:AuthByte/latch</code>, then
+            add this. It stays silent unless mail is waiting.
+          </p>
+          <CopyField label={checks[tab].label} value={checks[tab].code} hint={checks[tab].hint} />
+        </details>
       </div>
     </div>
   );
